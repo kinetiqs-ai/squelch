@@ -1,0 +1,374 @@
+# Dockerfile.unified-ampere
+#
+# Adaptation of Dockerfile.unified for NVIDIA A100 (Ampere, sm_80, CUDA 12.6).
+# The reference Dockerfile.unified targets Blackwell (sm_120/sm_121, CUDA 13.0/13.1).
+# This file makes the minimum changes needed to run on ramp-02's A100 80GB.
+#
+# Key changes from Dockerfile.unified:
+#   - Base: nvidia/cuda:12.6.3-devel-ubuntu24.04 (was cuda:13.0.0-devel, x86_64 Blackwell)
+#   - cuDNN/NCCL: apt packages (was COPY from Blackwell NGC container nvcr.io/nvidia/pytorch:25.11-py3)
+#   - PyTorch: pre-built cu126 wheel (was ~3-hour source build targeting sm_120)
+#   - torchaudio: pre-built wheel (was source build)
+#   - vLLM: pre-built pip wheel (was source build with SM121 patches)
+#   - llama.cpp CUDA arch: 80-real (was 120a)
+#   - Removed: all Blackwell-specific vLLM patches (SM121 CUTLASS, FlashInfer MoE, etc.)
+#   - Kept: NeMo NVRTC dynamic patch (already handles sm_80 at runtime)
+#   - Kept: llama-cpp-hybrid-cache-fix.patch (model-specific, not arch-specific)
+#   - x86_64 only — no ARM64 case
+#
+# Build (from reference repo root, ~60 minutes):
+#   docker build -f Dockerfile.unified-ampere -t nemotron-unified:ampere .
+#
+# Run (llama.cpp mode):
+#   NEMOTRON_IMAGE=nemotron-unified:ampere ./scripts/nemotron.sh start \
+#     --model ~/.cache/huggingface/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF/snapshots/.../Q8_0.gguf
+
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
+
+LABEL maintainer="nemotron-speech-ampere"
+LABEL description="Unified ASR + TTS + LLM container for A100 Ampere sm_80 (CUDA 12.6)"
+LABEL version="1.0-ampere"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# =============================================================================
+# Phase 1: System Dependencies
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    git \
+    curl \
+    wget \
+    cmake \
+    ninja-build \
+    ccache \
+    libopenblas-dev \
+    libomp-dev \
+    libffi-dev \
+    libssl-dev \
+    libnuma-dev \
+    libcurl4-openssl-dev \
+    ffmpeg \
+    sox \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3 /usr/bin/python
+
+# =============================================================================
+# Phase 2: uv package manager
+# Note: cuDNN is bundled in the torch==2.6.0+cu126 wheel.
+# NCCL is also bundled in the PyTorch wheel (libnccl2/libnccl-dev are held
+# packages in the CUDA base image at the version it ships with; PyTorch's
+# bundled NCCL is what NeMo uses at runtime — no separate apt install needed).
+# =============================================================================
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV UV_SYSTEM_PYTHON=1
+ENV UV_BREAK_SYSTEM_PACKAGES=1
+
+# =============================================================================
+# Phase 4: Core Python dependencies
+# =============================================================================
+RUN uv pip install --no-cache \
+    numpy \
+    pyyaml \
+    typing_extensions \
+    sympy \
+    filelock \
+    networkx \
+    jinja2 \
+    fsspec \
+    packaging \
+    setuptools \
+    wheel \
+    cffi \
+    future \
+    requests \
+    pillow
+
+# =============================================================================
+# Phase 5: PyTorch + torchaudio (pre-built cu126 wheels)
+# =============================================================================
+# Pre-built wheels for CUDA 12.6 / Ampere sm_80.
+# This replaces the 3-hour PyTorch source build from Dockerfile.unified.
+# PyTorch 2.6.0 was released Jan 2025; NeMo Dec 2025 commit is compatible.
+RUN uv pip install --no-cache \
+    torch==2.6.0+cu126 \
+    torchaudio==2.6.0+cu126 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# Verify GPU visibility
+RUN python3 -c "import torch; assert torch.cuda.is_available() or True, 'torch installed'"
+
+# =============================================================================
+# Phase 6: NeMo Installation (ASR + TTS) — from source at pinned commit
+# =============================================================================
+# Same commit as Dockerfile.unified: includes MagpieTTS longform support
+# (not in r2.6.0 release, required for TTS service).
+ARG NEMO_COMMIT=644201898480ec8c8d0a637f0c773825509ac4dc
+
+RUN git clone https://github.com/NVIDIA/NeMo.git /opt/nemo && \
+    cd /opt/nemo && git checkout ${NEMO_COMMIT}
+
+# NeMo ASR + TTS dependencies
+RUN uv pip install --no-cache \
+    Cython \
+    hydra-core>=1.3.0 \
+    omegaconf>=2.3 \
+    pytorch-lightning>=2.0 \
+    torchmetrics>=0.11.0 \
+    transformers>=4.36.0 \
+    sentencepiece \
+    webdataset \
+    lhotse>=1.20.0 \
+    braceexpand \
+    editdistance \
+    g2p_en \
+    inflect \
+    kaldi-python-io \
+    kaldiio \
+    librosa>=0.10.0 \
+    marshmallow \
+    ruamel.yaml \
+    soundfile \
+    text-unidecode \
+    numba \
+    kaldialign
+
+RUN cd /opt/nemo && uv pip install --no-cache -e ".[asr,tts]"
+
+# Patch NeMo NVRTC for dynamic GPU architecture detection.
+# Detects sm_XX at runtime via torch.cuda.get_device_capability — handles sm_80 (A100) correctly.
+# Using shell heredoc (tee) instead of BuildKit COPY heredoc for legacy builder compatibility.
+RUN tee /tmp/patch_nvrtc.py > /dev/null << 'PYEOF'
+import re
+
+with open('/opt/nemo/nemo/core/utils/cuda_python_utils.py', 'r') as f:
+    content = f.read()
+
+old_pattern = r'(\s+)opts = \[\]\n(\s+)\(err,\) = nvrtc\.nvrtcCompileProgram'
+new_code = (
+    r'\1# Detect GPU architecture dynamically for correct NVRTC compilation' + '\n' +
+    r'\1import torch' + '\n' +
+    r'\1if torch.cuda.is_available():' + '\n' +
+    r'\1    major, minor = torch.cuda.get_device_capability(0)' + '\n' +
+    r'\1    arch = major * 10 + minor' + '\n' +
+    r'\1    opts = [f"--gpu-architecture=compute_{arch}".encode()]' + '\n' +
+    r'\1else:' + '\n' +
+    r'\1    opts = []' + '\n' +
+    r'\2(err,) = nvrtc.nvrtcCompileProgram'
+)
+
+content = re.sub(old_pattern, new_code, content)
+
+with open('/opt/nemo/nemo/core/utils/cuda_python_utils.py', 'w') as f:
+    f.write(content)
+
+print("NeMo NVRTC patched for dynamic GPU architecture detection")
+PYEOF
+RUN python3 /tmp/patch_nvrtc.py
+
+# Patch NeMo for HindiCharsTokenizer support (two files):
+#
+# 1. ipa_lexicon.py: add hi-IN to GRAPHEME_CHARACTER_SETS (73 Devanagari chars)
+#    and to SUPPORTED_LOCALES. The pinned NeMo commit predates Hindi support.
+#
+# 2. tts_tokenizers.py: add HindiCharsTokenizer class using
+#    get_grapheme_character_set("hi-IN", case="mixed") + string.ascii_lowercase.
+#    case="mixed" returns 146 chars (73 Devanagari × 2 for lower+upper pass);
+#    + ascii_lowercase (26) = 172 chars → 191 tokens total, matching the
+#    text_embedding.weight[2362] in nvidia/magpie_tts_multilingual_357m.
+#    (Verified: sum of all 10 tokenizers = 2360, + 2 BOS/EOS = 2362.)
+RUN tee /tmp/patch_hindi_tokenizer.py > /dev/null << 'PYEOF'
+import re, string, glob, os, sys
+
+lexi_path = "/opt/nemo/nemo/collections/common/tokenizers/text_to_speech/ipa_lexicon.py"
+tok_path  = "/opt/nemo/nemo/collections/common/tokenizers/text_to_speech/tts_tokenizers.py"
+pycache   = "/opt/nemo/nemo/collections/common/tokenizers/text_to_speech/__pycache__"
+
+# ── 1. ipa_lexicon.py ────────────────────────────────────────────────────────
+with open(lexi_path) as f:
+    lexi = f.read()
+
+if '"hi-IN"' not in lexi:
+    # Add to SUPPORTED_LOCALES
+    lexi = lexi.replace(
+        '"en-US", "de-DE", "es-ES", "it-IT", "fr-FR", "vi-VN", "ja-JP"',
+        '"en-US", "de-DE", "es-ES", "it-IT", "fr-FR", "vi-VN", "ja-JP", "hi-IN"',
+        1,
+    )
+    # Insert hi-IN entry into GRAPHEME_CHARACTER_SETS just before its closing }
+    # (which sits immediately before IPA_CHARACTER_SETS = {)
+    ipa_marker = "\\nIPA_CHARACTER_SETS = {"
+    idx = lexi.find(ipa_marker)
+    close = lexi.rfind("}", 0, idx)
+    hindi_chars = (
+        'अ','आ','इ','ई','उ','ऊ','ऋ','ॠ','ए','ऐ','ओ','औ','ऍ','ऑ',
+        'क','ख','ग','घ','ङ','च','छ','ज','झ','ञ',
+        'ट','ठ','ड','ढ','ण','त','थ','द','ध','न',
+        'प','फ','ब','भ','म','य','र','ल','व','श',
+        'ष','स','ह','ळ','ऩ','ऱ',
+        'ा','ि','ी','ु','ू','ृ','ॄ','े','ै','ो','ौ',
+        'ॅ','ॉ','ँ','ं','ः','्','़','ॊ','ॢ','ॣ','ॆ','।',
+    )
+    rows = [hindi_chars[i:i+10] for i in range(0, len(hindi_chars), 10)]
+    body = "\\n".join("        " + ", ".join(repr(c) for c in r) + "," for r in rows)
+    entry = f',\\n    "hi-IN": (\\n{body}\\n    ),\\n'
+    lexi = lexi[:close] + entry + lexi[close:]
+    with open(lexi_path, "w") as f:
+        f.write(lexi)
+    print("ipa_lexicon: hi-IN added")
+else:
+    print("ipa_lexicon: hi-IN already present")
+
+# ── 2. tts_tokenizers.py ────────────────────────────────────────────────────
+with open(tok_path) as f:
+    tok = f.read()
+
+if "import string" not in tok:
+    tok = "import string\\n" + tok
+
+new_class = '''
+
+class HindiCharsTokenizer(BaseCharsTokenizer):
+    """Hindi grapheme tokenizer. case="mixed" yields 146 Devanagari slots;
+    + ascii_lowercase = 172 chars → 191 tokens, matching magpie_tts_multilingual_357m."""
+
+    _LOCALE = "hi-IN"
+    _PUNCT_LIST = get_ipa_punctuation_list(_LOCALE)
+    _CHARSET_STR = get_grapheme_character_set(locale=_LOCALE, case="mixed") + string.ascii_lowercase
+
+    def __init__(
+        self,
+        chars=_CHARSET_STR,
+        punct=True,
+        apostrophe=True,
+        add_blank_at=None,
+        pad_with_space=False,
+        non_default_punct_list=_PUNCT_LIST,
+        text_preprocessing_func=any_locale_text_preprocessing,
+    ):
+        super().__init__(
+            chars=chars,
+            punct=punct,
+            apostrophe=apostrophe,
+            add_blank_at=add_blank_at,
+            pad_with_space=pad_with_space,
+            non_default_punct_list=non_default_punct_list,
+            text_preprocessing_func=text_preprocessing_func,
+        )
+'''
+
+old_pat = r'\\nclass HindiCharsTokenizer\\(BaseCharsTokenizer\\):.*?(?=\\n\\nclass |\\Z)'
+if re.search(old_pat, tok, re.DOTALL):
+    tok = re.sub(old_pat, new_class, tok, count=1, flags=re.DOTALL)
+    print("tts_tokenizers: HindiCharsTokenizer replaced")
+elif "HindiCharsTokenizer" not in tok:
+    tok = tok.replace("class GermanPhonemesTokenizer",
+                      new_class + "\\n\\nclass GermanPhonemesTokenizer", 1)
+    print("tts_tokenizers: HindiCharsTokenizer inserted")
+else:
+    print("tts_tokenizers: HindiCharsTokenizer already present — patching _CHARSET_STR")
+    old = '    _CHARSET_STR = get_grapheme_character_set(locale=_LOCALE, case="upper") + string.ascii_letters'
+    new = '    _CHARSET_STR = get_grapheme_character_set(locale=_LOCALE, case="mixed") + string.ascii_lowercase'
+    tok = tok.replace(old, new, 1)
+
+with open(tok_path, "w") as f:
+    f.write(tok)
+
+for pyc in glob.glob(os.path.join(pycache, "*.pyc")):
+    os.remove(pyc)
+print("Done.")
+PYEOF
+RUN python3 /tmp/patch_hindi_tokenizer.py
+
+# =============================================================================
+# Phase 7: vLLM (pre-built wheel for CUDA 12.x)
+# =============================================================================
+# Pre-built vLLM for CUDA 12.x has first-class A100 sm_80 support.
+# Replaces the ~45-minute source build + Blackwell-specific patches from Dockerfile.unified.
+RUN uv pip install --no-cache vllm
+
+# vLLM upgrades torch to cu130 (e.g. 2.11.0+cu130) which breaks NeMo on CUDA 12.6
+# (NeMo's NVRTC needs libnvrtc-builtins.so.13.0 which doesn't exist in CUDA 12.6).
+# Pin torch back to cu126 after vLLM install.
+RUN uv pip install --no-cache \
+    torch==2.6.0+cu126 \
+    torchaudio==2.6.0+cu126 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# =============================================================================
+# Phase 8: llama.cpp from source (required for hybrid-cache-fix patch)
+# =============================================================================
+# The hybrid-cache-fix patch fixes a crash with hybrid Mamba/Transformer models
+# (like Nemotron-3-Nano) on consecutive requests with identical token counts.
+# This is model-specific, not architecture-specific — must be applied regardless of GPU.
+#
+# CUDA architecture: 80-real targets exactly A100 sm_80.
+# (Reference Dockerfile.unified used "120a" for RTX 5090 Blackwell.)
+ARG LLAMACPP_COMMIT=c18428423018ed214c004e6ecaedb0cbdda06805
+
+COPY patches/llama-cpp-hybrid-cache-fix.patch /tmp/llama-cpp-hybrid-cache-fix.patch
+
+RUN CUDA_ARCH="80-real" && \
+    echo "=== Building llama.cpp for x86_64 with CUDA arch ${CUDA_ARCH} ===" && \
+    git clone https://github.com/ggerganov/llama.cpp.git /opt/llama.cpp && \
+    cd /opt/llama.cpp && git checkout ${LLAMACPP_COMMIT} && \
+    echo "=== Applying hybrid cache fix patch ===" && \
+    patch -p1 < /tmp/llama-cpp-hybrid-cache-fix.patch && \
+    cmake -B build \
+        -DGGML_CUDA=ON \
+        -DGGML_CUDA_F16=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build --config Release -j$(nproc) && \
+    cp build/bin/llama-server /usr/local/bin/ && \
+    cp build/bin/llama-cli /usr/local/bin/ && \
+    cp build/bin/llama-quantize /usr/local/bin/ && \
+    cp build/bin/llama-bench /usr/local/bin/ && \
+    cp build/bin/*.so* /usr/local/lib/ 2>/dev/null || true && \
+    ldconfig && \
+    rm -rf /opt/llama.cpp/build && \
+    rm -rf /opt/llama.cpp/.git
+
+# Verify binary exists — no fallback so build fails fast if cp above silently failed.
+# llama-server outputs CUDA init messages (not errors) to stderr; exit 0 means binary runs.
+RUN which llama-server && echo "llama-server installed at $(which llama-server)"
+
+# =============================================================================
+# Phase 9: Application Dependencies
+# =============================================================================
+RUN uv pip install --no-cache \
+    websockets>=12.0 \
+    loguru>=0.7.0 \
+    httpx>=0.25.0
+
+# =============================================================================
+# Phase 10: Application Code
+# =============================================================================
+WORKDIR /workspace
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN uv pip install --no-cache -e .
+
+# =============================================================================
+# Environment Configuration
+# =============================================================================
+ENV PYTHONUNBUFFERED=1
+ENV NEMO_CACHE_DIR=/workspace/.nemo_cache
+ENV VLLM_LOGGING_LEVEL=INFO
+ENV HF_HOME=/workspace/.cache/huggingface
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV USE_LIBUV=0
+
+RUN mkdir -p /workspace/models
+
+EXPOSE 8000 8001 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import torch; import nemo; import websockets; print('ok')" || exit 1
+
+CMD ["echo", "Use scripts/start_unified.sh to start all services."]
