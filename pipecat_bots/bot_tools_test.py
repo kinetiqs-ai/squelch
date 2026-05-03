@@ -3,7 +3,7 @@
 # PipeCat tool calling validation bot for Issue #197 spike.
 #
 # Tests tool/function calling through the full PipeCat pipeline:
-#   ASR (NVidiaWebSocketSTTService) → OpenAILLMService (llama.cpp) → TTS (MagpieWebSocketTTSService)
+#   ASR (NVidiaWebSocketSTTService) → OpenAILLMService (llama.cpp) → TTS (OrpheusHTTPTTSService)
 #
 # Uses OpenAILLMService instead of LlamaCppBufferedLLMService because the
 # buffered service does not implement tool calling. OpenAILLMService connects
@@ -15,7 +15,7 @@
 #   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
 #   NVIDIA_LLM_URL        llama.cpp OpenAI API URL (default: http://localhost:8000/v1)
 #   NVIDIA_LLM_MODEL      Model name as returned by llama.cpp (default: auto-detected)
-#   NVIDIA_TTS_URL        Magpie TTS server URL (default: http://localhost:8001)
+#   NVIDIA_TTS_URL        Orpheus TTS server URL (default: http://localhost:8001)
 #
 # Usage (run from reference repo root):
 #   uv run spike/pipecat-reference/bot_tools_test.py -t webrtc --host 0.0.0.0
@@ -57,7 +57,7 @@ import httpx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../pipecat_bots"))
 
 from nvidia_stt import NVidiaWebSocketSTTService  # noqa: E402
-from magpie_websocket_tts import MagpieWebSocketTTSService  # noqa: E402
+from orpheus_http_tts import OrpheusHTTPTTSService  # noqa: E402
 
 load_dotenv(override=True)
 
@@ -128,15 +128,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         sample_rate=16000,
     )
 
-    tts = MagpieWebSocketTTSService(
+    tts = OrpheusHTTPTTSService(
         server_url=NVIDIA_TTS_URL,
-        voice="aria",
-        language="en",
-        params=MagpieWebSocketTTSService.InputParams(
-            language="en",
-            streaming_preset="conservative",
-            use_adaptive_mode=True,
-        ),
+        voice="tara",
     )
 
     llm = OpenAILLMService(

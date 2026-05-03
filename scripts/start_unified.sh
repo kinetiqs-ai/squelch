@@ -259,8 +259,9 @@ TOTAL_STEPS=0
 # Start TTS first (smaller model, avoids GPU memory fragmentation on 32GB GPUs)
 if [ "$ENABLE_TTS" = "true" ]; then
     STEP=$((STEP + 1))
-    echo "[$STEP/$TOTAL_STEPS] Starting TTS server on port 8001..."
-    python -m nemotron_speech.tts_server --port 8001 > "$LOG_DIR/tts.log" 2>&1 &
+    echo "[$STEP/$TOTAL_STEPS] Starting Orpheus TTS server on port 8001..."
+    ORPHEUS_VOICE="${ORPHEUS_VOICE:-tara}"
+    python -m nemotron_speech.orpheus_tts_server --port 8001 > "$LOG_DIR/tts.log" 2>&1 &
     TTS_PID=$!
     echo "  TTS started (PID $TTS_PID, log: $LOG_DIR/tts.log)"
 fi

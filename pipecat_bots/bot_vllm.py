@@ -10,7 +10,7 @@
 #   NVIDIA_LLM_URL        vLLM API URL (default: http://localhost:8000/v1)
 #   NVIDIA_LLM_MODEL      Model name/path (default: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
 #   NVIDIA_LLM_API_KEY    API key for vLLM (default: not-needed)
-#   NVIDIA_TTS_URL        Magpie TTS server URL (default: http://localhost:8001)
+#   NVIDIA_TTS_URL        Orpheus TTS server URL (default: http://localhost:8001)
 #
 # Usage:
 #   uv run pipecat_bots/bot_vllm.py
@@ -45,7 +45,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 # Import our custom local services
 from nvidia_stt import NVidiaWebSocketSTTService
-from magpie_websocket_tts import MagpieWebSocketTTSService
+from orpheus_http_tts import OrpheusHTTPTTSService
 from v2v_metrics import V2VMetricsProcessor
 
 load_dotenv(override=True)
@@ -101,18 +101,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         sample_rate=16000,
     )
 
-    # WebSocket Magpie TTS (batch-only mode - vLLM doesn't do sentence-boundary chunking)
-    tts = MagpieWebSocketTTSService(
+    tts = OrpheusHTTPTTSService(
         server_url=NVIDIA_TTS_URL,
-        voice="aria",
-        language="en",
-        params=MagpieWebSocketTTSService.InputParams(
-            language="en",
-            streaming_preset="conservative",
-            use_adaptive_mode=True,
-        ),
+        voice="tara",
     )
-    logger.info("Using WebSocket Magpie TTS (adaptive mode)")
+    logger.info("Using Orpheus HTTP TTS")
 
     # vLLM via OpenAI-compatible API
     llm = OpenAILLMService(

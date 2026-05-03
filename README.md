@@ -2,33 +2,31 @@
 
 Fork of [pipecat-ai/nemotron-january-2026](https://github.com/pipecat-ai/nemotron-january-2026) adapted for A100 (Ampere) hardware on ramp-02. This repo is the foundation for the Squad Goals voice sidecar service (Issue #196).
 
-## Current State (v0.1.0)
+## Current State
 
-**Spike validation complete.** PipeCat reference implementation runs on ramp-02's A100 80GB with competitive latency. Verdict: GO for PipeCat as voice pipeline framework.
+**TTS replaced: Magpie → Orpheus.** The original Magpie TTS (NVIDIA, 357M params, NeMo-based) had audible pop/click artifacts from its non-causal HiFi-GAN vocoder. Replaced with Orpheus TTS (Canopy Labs, 3B params, Llama 3.2 derivative) which generates SNAC codec tokens decoded to clean 24kHz audio.
+
+### Architecture
+
+| Port | Service | Model |
+|------|---------|-------|
+| 8080 | ASR | NeMo Parakeet (streaming WebSocket) |
+| 8001 | TTS | Orpheus 3B via vLLM + SNAC decoder |
+| 8000 | LLM | Nemotron-3-Nano (llama.cpp or vLLM) |
 
 ### What Works
 
-- **Dockerfile.unified-ampere** — builds on CUDA 12.6 with pre-built PyTorch/vLLM wheels + llama.cpp from source for sm_80. ~60 min build (vs 2-3 hrs for Blackwell source builds).
-- **All three model services** healthy simultaneously: ASR (port 8080), TTS (port 8001), LLM (port 8000). Total VRAM: 29 GB / 81 GB (35.5%).
-- **V2V latency** estimated 470-630ms (ASR 160ms + LLM 56ms + TTS 254ms). Well under 1s target.
-- **Tool calling** via `bot_tools_test.py` using `OpenAILLMService` pointed at llama.cpp's OpenAI endpoint. `LlamaCppBufferedLLMService` has no tool calling support.
-- **Barge-in** via PipeCat core (SileroVAD + SmartTurn). No custom code in the interrupt path.
-- **WebRTC** accessible over Tailscale HTTPS at `https://ramp-02.tail314cde.ts.net:7860/client`
+- **Dockerfile.unified-ampere** — CUDA 12.6, pre-built PyTorch/vLLM wheels, sm_80 llama.cpp, SNAC decoder
+- **Orpheus TTS** — 8 voices (tara, leah, jess, leo, dan, mia, zac, zoe), emotion tags, 24kHz output, SNAC logit processor for token validity
+- **All three model services** healthy simultaneously. Estimated VRAM: ~37 GB / 81 GB
+- **Tool calling** via `bot_tools_test.py` using `OpenAILLMService` pointed at llama.cpp
+- **Barge-in** via PipeCat core (SileroVAD + SmartTurn)
+- **WebRTC** accessible over Tailscale HTTPS
 
 ### Known Issues
 
-- **TTS audio pops at chunk boundaries.** Magpie TTS uses a non-causal HiFi-GAN vocoder that generates inconsistent waveforms in streaming mode. This is a documented model limitation, not a PipeCat problem. The overlap-add crossfade mitigates but doesn't eliminate it. See [Daily.co blog post](https://www.daily.co/blog/building-voice-agents-with-nvidia-open-models/) for the authors' acknowledgment.
-- **NeMo HindiCharsTokenizer patch required.** The pinned NeMo commit (644201898, Dec 2025) predates the `HindiCharsTokenizer` class needed by Magpie TTS. Patched via `docker commit` at runtime. A NeMo commit post-Jan-27-2026 includes it natively.
-- **llama-server must be built in-container.** Docker build has no GPU access, so the binary must be compiled after `docker run --gpus all`. The Dockerfile verifies with `which llama-server` (hard fail, no `|| echo`).
+- **llama-server must be built in-container.** Docker build has no GPU access.
 - **LLM startup takes ~90s.** Q4 30B model load requires `SERVICE_TIMEOUT=300`.
-
-### Build Obstacles Resolved
-
-Three non-trivial issues were hit and fixed during the spike. Full details in the [Squad Goals validation report](https://github.com/magnum6actual/squad-goals/blob/issue-197-pipecat-reference-deploy/docs/spike/issue-197-validation-report.md):
-
-1. **HindiCharsTokenizer vocab mismatch** — 6+ iterations to identify correct tokenizer config (`case="mixed"` + `ascii_lowercase` = 191 tokens matching checkpoint)
-2. **llama-server missing from image** — `|| echo` fallback masked the failure; rebuilt in-container with GPU
-3. **SERVICE_TIMEOUT too short** — Q4 30B needs ~90s to load; default 60s caused abort
 
 ## Quick Start (ramp-02)
 
@@ -65,16 +63,15 @@ Open `https://ramp-02.tail314cde.ts.net:7861/client` and ask "what time is it?"
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile.unified-ampere` | A100 adaptation: CUDA 12.6, pre-built wheels, sm_80 llama.cpp, NeMo patches |
+| `Dockerfile.unified-ampere` | A100 adaptation: CUDA 12.6, pre-built wheels, sm_80 llama.cpp, SNAC decoder |
+| `src/nemotron_speech/orpheus_tts_server.py` | Orpheus TTS server: vLLM + SNAC decoder, HTTP streaming API |
+| `pipecat_bots/orpheus_http_tts.py` | PipeCat TTS adapter for Orpheus HTTP streaming |
 | `pipecat_bots/bot_tools_test.py` | Tool calling validation bot (OpenAILLMService + get_current_time) |
-
-Everything else is from the upstream reference implementation ([pipecat-ai/nemotron-january-2026](https://github.com/pipecat-ai/nemotron-january-2026)).
 
 ## Next Steps (Issue #196)
 
 This repo becomes the voice sidecar service for Squad Goals. Key decisions for #196:
 
-- **TTS model:** Replace Magpie with Chatterbox (or another model without streaming vocoder artifacts)
 - **LLM:** Replace Nemotron-3-Nano with the Squad Goals agent LLM (Anthropic API via envelope dispatch)
 - **Transport:** WebRTC for browser, possibly Twilio for telephony
 - **Integration:** PipeCat pipeline receives audio, dispatches to the agent system, speaks responses
