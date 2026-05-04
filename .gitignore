@@ -50,6 +50,11 @@ env/
 # Claude Code
 .claude/
 
+# Local secrets and machine-specific runtime configuration
+.env
+.env.*
+!.env.example
+
 # Lock files (large and platform-specific)
 uv.lock
 
