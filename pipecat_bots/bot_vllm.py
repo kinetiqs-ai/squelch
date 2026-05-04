@@ -61,26 +61,38 @@ NVIDIA_LLM_API_KEY = os.getenv("NVIDIA_LLM_API_KEY", "not-needed")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
 # VAD configuration - used by both VAD analyzer and V2V metrics
-VAD_STOP_SECS = 0.2
+VAD_CONFIDENCE = float(os.getenv("VAD_CONFIDENCE", "0.7"))
+VAD_START_SECS = float(os.getenv("VAD_START_SECS", "0.12"))
+VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "0.2"))
+VAD_MIN_VOLUME = float(os.getenv("VAD_MIN_VOLUME", "0.25"))
+
+
+def vad_params() -> VADParams:
+    return VADParams(
+        confidence=VAD_CONFIDENCE,
+        start_secs=VAD_START_SECS,
+        stop_secs=VAD_STOP_SECS,
+        min_volume=VAD_MIN_VOLUME,
+    )
 
 # Transport configurations with VAD and SmartTurn analyzer
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
 }
@@ -93,7 +105,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"  LLM Model: {NVIDIA_LLM_MODEL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
     logger.info(f"  Transport: {type(transport).__name__}")
-    logger.info(f"  VAD stop_secs: {VAD_STOP_SECS}s")
+    logger.info(
+        "  VAD: "
+        f"confidence={VAD_CONFIDENCE}, start_secs={VAD_START_SECS}, "
+        f"stop_secs={VAD_STOP_SECS}, min_volume={VAD_MIN_VOLUME}"
+    )
 
     # NVIDIA Parakeet ASR via WebSocket
     stt = NVidiaWebSocketSTTService(

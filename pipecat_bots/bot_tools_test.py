@@ -66,25 +66,37 @@ NVIDIA_LLM_URL = os.getenv("NVIDIA_LLM_URL", "http://localhost:8000/v1")
 NVIDIA_LLM_MODEL = os.getenv("NVIDIA_LLM_MODEL", "")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
-VAD_STOP_SECS = 0.2
+VAD_CONFIDENCE = float(os.getenv("VAD_CONFIDENCE", "0.7"))
+VAD_START_SECS = float(os.getenv("VAD_START_SECS", "0.12"))
+VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "0.2"))
+VAD_MIN_VOLUME = float(os.getenv("VAD_MIN_VOLUME", "0.25"))
+
+
+def vad_params() -> VADParams:
+    return VADParams(
+        confidence=VAD_CONFIDENCE,
+        start_secs=VAD_START_SECS,
+        stop_secs=VAD_STOP_SECS,
+        min_volume=VAD_MIN_VOLUME,
+    )
 
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
         port=7861,
     ),
