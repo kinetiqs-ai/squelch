@@ -6,7 +6,9 @@
 # Uses longer silence threshold (800ms) for more conservative turn detection.
 #
 # Environment variables:
-#   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
+#   ASR_BACKEND           nemotron (default) or voxtral
+#   NVIDIA_ASR_URL        Nemotron ASR WebSocket URL (default: ws://localhost:8080)
+#   VOXTRAL_ASR_URL       Voxtral Realtime URL (default: ws://localhost:8082/v1/realtime)
 #   NVIDIA_LLAMA_CPP_URL  llama.cpp API URL (default: http://localhost:8000)
 #   NVIDIA_TTS_URL        Orpheus TTS server URL (default: http://localhost:8001)
 #
@@ -36,14 +38,13 @@ from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 # Import our custom local services
-from nvidia_stt import NVidiaWebSocketSTTService
+from asr_factory import create_stt_service, describe_asr_backend
 from orpheus_http_tts import OrpheusHTTPTTSService
 from llama_cpp_chunked_llm import LlamaCppChunkedLLMService
 
 load_dotenv(override=True)
 
 # Configuration from environment
-NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
 NVIDIA_LLAMA_CPP_URL = os.getenv("NVIDIA_LLAMA_CPP_URL", "http://localhost:8000")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
@@ -67,18 +68,21 @@ transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
+        vad_audio_passthrough=True,
         vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         # NO turn_analyzer - just simple VAD
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
+        vad_audio_passthrough=True,
         vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         # NO turn_analyzer
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
+        vad_audio_passthrough=True,
         vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         # NO turn_analyzer
     ),
@@ -87,7 +91,7 @@ transport_params = {
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info("Starting simple VAD bot (NO SmartTurn)")
-    logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
+    logger.info(f"  ASR: {describe_asr_backend()}")
     logger.info(f"  LLM URL: {NVIDIA_LLAMA_CPP_URL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
     logger.info(
@@ -97,11 +101,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
     logger.info(f"  Transport: {type(transport).__name__}")
 
-    # NVIDIA Parakeet ASR via WebSocket
-    stt = NVidiaWebSocketSTTService(
-        url=NVIDIA_ASR_URL,
-        sample_rate=16000,
-    )
+    stt = create_stt_service(sample_rate=16000)
 
     # Orpheus TTS via local HTTP streaming server.
     tts = OrpheusHTTPTTSService(

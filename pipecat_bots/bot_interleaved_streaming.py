@@ -7,7 +7,9 @@
 # SmartTurn analyzer for responsive turn-taking.
 #
 # Environment variables:
-#   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
+#   ASR_BACKEND           nemotron (default) or voxtral
+#   NVIDIA_ASR_URL        Nemotron ASR WebSocket URL (default: ws://localhost:8080)
+#   VOXTRAL_ASR_URL       Voxtral Realtime URL (default: ws://localhost:8082/v1/realtime)
 #   NVIDIA_LLAMA_CPP_URL  llama.cpp API URL (default: http://localhost:8000)
 #   NVIDIA_TTS_URL        Orpheus TTS server URL (default: http://localhost:8001)
 #   ENABLE_RECORDING      Enable audio recording (default: false)
@@ -49,7 +51,8 @@ from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 # Import our custom local services
-from nvidia_stt import NVidiaWebSocketSTTService
+from asr_audio_diagnostics import ASRAudioDiagnosticsProcessor
+from asr_factory import create_stt_service, describe_asr_backend
 from orpheus_http_tts import OrpheusHTTPTTSService
 from llama_cpp_buffered_llm import LlamaCppBufferedLLMService
 from v2v_metrics import V2VMetricsProcessor
@@ -70,13 +73,14 @@ class ContextTimingWrapper(FrameProcessor):
 load_dotenv(override=True)
 
 # Configuration from environment
-NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
 NVIDIA_LLAMA_CPP_URL = os.getenv("NVIDIA_LLAMA_CPP_URL", "http://localhost:8000")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
 # Audio recording configuration
 ENABLE_RECORDING = os.getenv("ENABLE_RECORDING", "false").lower() == "true"
+ENABLE_ASR_DIAGNOSTICS = os.getenv("ENABLE_ASR_DIAGNOSTICS", "false").lower() == "true"
 RECORDINGS_DIR = Path(__file__).parent.parent / "recordings"
+ASR_DIAGNOSTICS_DIR = os.getenv("ASR_DIAGNOSTICS_DIR", "diagnostics/asr")
 
 # VAD configuration - used by both VAD analyzer and V2V metrics
 VAD_CONFIDENCE = float(os.getenv("VAD_CONFIDENCE", "0.7"))
@@ -125,18 +129,21 @@ transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
+        vad_audio_passthrough=True,
         vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
+        vad_audio_passthrough=True,
         vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
+        vad_audio_passthrough=True,
         vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
@@ -145,22 +152,19 @@ transport_params = {
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info("Starting interleaved streaming bot")
-    logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
+    logger.info(f"  ASR: {describe_asr_backend()}")
     logger.info(f"  LLM URL: {NVIDIA_LLAMA_CPP_URL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
     logger.info(f"  Transport: {type(transport).__name__}")
     logger.info(f"  Recording: {'enabled' if ENABLE_RECORDING else 'disabled'}")
+    logger.info(f"  ASR diagnostics: {'enabled' if ENABLE_ASR_DIAGNOSTICS else 'disabled'}")
     logger.info(
         "  VAD: "
         f"confidence={VAD_CONFIDENCE}, start_secs={VAD_START_SECS}, "
         f"stop_secs={VAD_STOP_SECS}, min_volume={VAD_MIN_VOLUME}"
     )
 
-    # NVIDIA Parakeet ASR via WebSocket
-    stt = NVidiaWebSocketSTTService(
-        url=NVIDIA_ASR_URL,
-        sample_rate=16000,
-    )
+    stt = create_stt_service(sample_rate=16000)
 
     # Orpheus TTS via local HTTP streaming server.
     # The adapter preserves the LLM/TTS continue-frame backpressure contract.
@@ -239,14 +243,21 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     pipeline_processors = [
         transport.input(),
         rtvi,
-        stt,
-        context_aggregator.user(),
-        context_timing,  # Log when LLMMessagesFrame passes through
-        llm,
-        tts,
-        v2v_metrics,
-        transport.output(),
     ]
+    if ENABLE_ASR_DIAGNOSTICS:
+        pipeline_processors.append(ASRAudioDiagnosticsProcessor(output_dir=ASR_DIAGNOSTICS_DIR))
+
+    pipeline_processors.extend(
+        [
+            stt,
+            context_aggregator.user(),
+            context_timing,  # Log when LLMMessagesFrame passes through
+            llm,
+            tts,
+            v2v_metrics,
+            transport.output(),
+        ]
+    )
 
     # Add audio buffer if recording is enabled
     if audiobuffer:

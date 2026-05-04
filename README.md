@@ -62,6 +62,43 @@ This is Pipecat's default WebRTC reference client served by the runner. It uses 
 
 Open `http://localhost:7861/client` locally, or `https://ramp-02.tail314cde.ts.net:7861/client` from the Tailscale network. Ask "what time is it?"
 
+### Experimental Voxtral ASR
+
+Voxtral runs as a separate experimental ASR service so the released Nemotron ASR path remains the default.
+
+```bash
+./scripts/voxtral.sh build
+./scripts/voxtral.sh start
+./scripts/nemotron.sh bot --asr voxtral --port 7861
+```
+
+Open `https://ramp-02.tail314cde.ts.net:7860/client` when Tailscale Serve is proxying to local port `7861`.
+
+Compare both ASR backends on the same WAV:
+
+```bash
+uv run python scripts/compare_asr.py recordings/example.wav \
+  --reference "expected transcript"
+```
+
+If the host Python environment is not synced, run the comparison from the Voxtral container:
+
+```bash
+docker exec voxtral-asr bash -lc \
+  'cd /workspace && python3 scripts/compare_asr.py tests/fixtures/harvard_16k.wav --backend voxtral'
+```
+
+Defaults:
+
+| Setting | Default |
+|---------|---------|
+| `ASR_BACKEND` | `nemotron` |
+| `NVIDIA_ASR_URL` | `ws://localhost:8080` |
+| `VOXTRAL_ASR_URL` | `ws://host.docker.internal:8082/v1/realtime` in bots |
+| Voxtral host port | `8082` |
+| `VOXTRAL_GPU_MEMORY_UTILIZATION` | `0.35` |
+| `VOXTRAL_MAX_MODEL_LEN` | `32768` |
+
 ## Our Additions
 
 | File | Purpose |
@@ -70,6 +107,9 @@ Open `http://localhost:7861/client` locally, or `https://ramp-02.tail314cde.ts.n
 | `src/nemotron_speech/orpheus_tts_server.py` | Local Orpheus TTS HTTP streaming server |
 | `pipecat_bots/orpheus_http_tts.py` | PipeCat TTS adapter preserving LLM/TTS backpressure |
 | `pipecat_bots/bot_tools_test.py` | Tool calling validation bot (OpenAILLMService + get_current_time) |
+| `Dockerfile.voxtral-asr` | Experimental isolated Voxtral Realtime ASR image |
+| `pipecat_bots/voxtral_stt.py` | PipeCat STT adapter for vLLM Realtime Voxtral |
+| `scripts/compare_asr.py` | A/B test utility for Nemotron vs Voxtral ASR |
 
 Everything else is from the upstream reference implementation ([pipecat-ai/nemotron-january-2026](https://github.com/pipecat-ai/nemotron-january-2026)).
 

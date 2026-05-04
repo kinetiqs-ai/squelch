@@ -63,6 +63,8 @@ WEBSOCKET_PLANNING.md
 
 # Test outputs
 tests/fixtures/output/
+test_outputs/
+diagnostics/
 
 # Large test fixtures (keep only harvard_16k.wav)
 tests/fixtures/harvard.wav

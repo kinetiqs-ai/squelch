@@ -99,6 +99,7 @@ Start Options:
 Bot Options:
   BOT                 interleaved (default), tools, or simple
   --port PORT         WebRTC runner port (default: 7860; tools defaults to 7861)
+  --asr BACKEND       ASR backend for bot: nemotron (default) or voxtral
   --foreground, -f    Attach to bot logs instead of starting in background
 
 Examples:
@@ -341,6 +342,7 @@ cmd_start() {
             --gpus all
             --network=host
             --ipc=host
+            --add-host=host.docker.internal:host-gateway
             -v "$PROJECT_DIR:/workspace"
             -v "$HOME/.cache/huggingface:/root/.cache/huggingface"
             -e "ENABLE_ASR=$ENABLE_ASR"
@@ -359,6 +361,7 @@ cmd_start() {
             --name "$CONTAINER_NAME"
             --gpus all
             --ipc=host
+            --add-host=host.docker.internal:host-gateway
             -v "$PROJECT_DIR:/workspace"
             -v "$HOME/.cache/huggingface:/root/.cache/huggingface"
             -p 8000:8000
@@ -504,6 +507,7 @@ cmd_bot() {
 
     BOT_NAME="interleaved"
     BOT_PORT=""
+    BOT_ASR="${ASR_BACKEND:-nemotron}"
     BOT_FOREGROUND="false"
 
     if [[ $# -gt 0 ]] && [[ "$1" != --* ]] && [[ "$1" != "-f" ]]; then
@@ -515,6 +519,10 @@ cmd_bot() {
         case $1 in
             --port)
                 BOT_PORT="$2"
+                shift 2
+                ;;
+            --asr)
+                BOT_ASR="$2"
                 shift 2
                 ;;
             --foreground|-f)
@@ -552,16 +560,27 @@ cmd_bot() {
             ;;
     esac
 
-    BOT_CMD="cd /workspace && python $BOT_SCRIPT -t webrtc --host 0.0.0.0 --port $BOT_PORT"
+    BOT_ENV="ASR_BACKEND=$BOT_ASR"
+    if [[ "${ENABLE_ASR_DIAGNOSTICS:-false}" == "true" ]]; then
+        BOT_ENV="$BOT_ENV ENABLE_ASR_DIAGNOSTICS=true"
+        BOT_ENV="$BOT_ENV ASR_DIAGNOSTICS_DIR=${ASR_DIAGNOSTICS_DIR:-diagnostics/asr}"
+    fi
+    if [[ "$BOT_ASR" == "voxtral" ]]; then
+        BOT_ENV="$BOT_ENV VOXTRAL_ASR_URL=${VOXTRAL_ASR_URL:-ws://172.17.0.1:8082/v1/realtime}"
+    fi
+
+    BOT_CMD="cd /workspace && $BOT_ENV python $BOT_SCRIPT -t webrtc --host 0.0.0.0 --port $BOT_PORT"
 
     if [[ "$BOT_FOREGROUND" == "true" ]]; then
         echo "Starting $BOT_NAME bot in foreground..."
+        echo "ASR backend: $BOT_ASR"
         echo "Open http://localhost:${BOT_PORT}/client in your browser"
         docker exec -it "$CONTAINER_NAME" bash -lc "$BOT_CMD"
     else
         echo "Starting $BOT_NAME bot in background..."
         docker exec -d "$CONTAINER_NAME" bash -lc "mkdir -p /var/log/nemotron && $BOT_CMD > $LOG_FILE 2>&1"
         echo "Bot started."
+        echo "ASR backend: $BOT_ASR"
         echo "Open http://localhost:${BOT_PORT}/client in your browser"
         echo "Logs: ./scripts/nemotron.sh logs bot"
     fi
