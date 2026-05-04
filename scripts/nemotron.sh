@@ -8,8 +8,9 @@
 #   ./scripts/nemotron.sh start [OPTIONS]     Start the container
 #   ./scripts/nemotron.sh stop                Stop the container
 #   ./scripts/nemotron.sh restart [OPTIONS]   Restart the container
+#   ./scripts/nemotron.sh bot [BOT] [OPTIONS] Start a WebRTC bot for browser testing
 #   ./scripts/nemotron.sh status              Show container and service status
-#   ./scripts/nemotron.sh logs [SERVICE]      View logs (asr, tts, llm, or all)
+#   ./scripts/nemotron.sh logs [SERVICE]      View logs (asr, tts, llm, bot, or all)
 #   ./scripts/nemotron.sh shell               Open a shell in the container
 #   ./scripts/nemotron.sh help                Show this help message
 #
@@ -35,7 +36,7 @@ set -e
 # Configuration
 # =============================================================================
 CONTAINER_NAME="${NEMOTRON_CONTAINER_NAME:-nemotron}"
-IMAGE_NAME="${NEMOTRON_IMAGE:-nemotron-unified:cuda13}"
+IMAGE_NAME="${NEMOTRON_IMAGE:-nemotron-unified:ampere}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -55,7 +56,7 @@ DEFAULT_VLLM_FP8_MODEL="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
 
 # HuggingFace model cache paths for ASR and TTS (auto-downloaded on first run)
 HF_CACHE_ASR="$HOME/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b"
-HF_CACHE_TTS="$HOME/.cache/huggingface/hub/models--nvidia--magpie_tts_multilingual_357m"
+HF_CACHE_TTS="$HOME/.cache/huggingface/hub/models--canopylabs--orpheus-3b-0.1-ft"
 
 # Auto-detect LLM mode based on available models (prefer Q8 if available)
 if [[ -n "$DEFAULT_Q8_MODEL" ]]; then
@@ -80,8 +81,9 @@ Commands:
   start [OPTIONS]     Start the container
   stop                Stop the container
   restart [OPTIONS]   Restart the container
+  bot [BOT] [OPTIONS] Start a WebRTC bot for browser testing
   status              Show container and service status
-  logs [SERVICE]      View logs (asr, tts, llm, or all)
+  logs [SERVICE]      View logs (asr, tts, llm, bot, or all)
   shell               Open a shell in the container
   help                Show this help message
 
@@ -93,6 +95,12 @@ Start Options:
   --no-llm            Disable LLM service
   --detach, -d        Run in background (default)
   --foreground, -f    Run in foreground
+
+Bot Options:
+  BOT                 interleaved (default), tools, or simple
+  --port PORT         WebRTC runner port (default: 7860; tools defaults to 7861)
+  --asr BACKEND       ASR backend for bot: nemotron (default) or voxtral
+  --foreground, -f    Attach to bot logs instead of starting in background
 
 Examples:
   # Start with default Q8 model
@@ -111,10 +119,18 @@ Examples:
   # Follow all logs
   ./scripts/nemotron.sh logs
 
+  # Start browser-test bot, then open http://localhost:7860/client
+  ./scripts/nemotron.sh bot
+
+  # Start tool-calling bot, then open http://localhost:7861/client
+  ./scripts/nemotron.sh bot tools
+
 Environment Variables:
   NEMOTRON_CONTAINER_NAME   Container name (default: nemotron)
-  NEMOTRON_IMAGE            Docker image (default: nemotron-unified:cuda13)
+  NEMOTRON_IMAGE            Docker image (default: nemotron-unified:ampere)
   HUGGINGFACE_ACCESS_TOKEN  HuggingFace token for gated models
+  ORPHEUS_MODEL             Orpheus TTS model (default: canopylabs/orpheus-3b-0.1-ft)
+  ORPHEUS_VOICE             Orpheus voice used by bots (default: tara)
 EOF
 }
 
@@ -326,6 +342,7 @@ cmd_start() {
             --gpus all
             --network=host
             --ipc=host
+            --add-host=host.docker.internal:host-gateway
             -v "$PROJECT_DIR:/workspace"
             -v "$HOME/.cache/huggingface:/root/.cache/huggingface"
             -e "ENABLE_ASR=$ENABLE_ASR"
@@ -335,6 +352,8 @@ cmd_start() {
             -e "HF_HOME=/root/.cache/huggingface"
             -e "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
             -e "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}"
+            -e "ORPHEUS_MODEL=${ORPHEUS_MODEL:-canopylabs/orpheus-3b-0.1-ft}"
+            -e "ORPHEUS_GPU_MEMORY_UTILIZATION=${ORPHEUS_GPU_MEMORY_UTILIZATION:-0.25}"
         )
     else
         DOCKER_ARGS=(
@@ -342,11 +361,14 @@ cmd_start() {
             --name "$CONTAINER_NAME"
             --gpus all
             --ipc=host
+            --add-host=host.docker.internal:host-gateway
             -v "$PROJECT_DIR:/workspace"
             -v "$HOME/.cache/huggingface:/root/.cache/huggingface"
             -p 8000:8000
             -p 8001:8001
             -p 8080:8080
+            -p 127.0.0.1:7860:7860
+            -p 127.0.0.1:7861:7861
             -e "ENABLE_ASR=$ENABLE_ASR"
             -e "ENABLE_TTS=$ENABLE_TTS"
             -e "ENABLE_LLM=$ENABLE_LLM"
@@ -354,6 +376,8 @@ cmd_start() {
             -e "HF_HOME=/root/.cache/huggingface"
             -e "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
             -e "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}"
+            -e "ORPHEUS_MODEL=${ORPHEUS_MODEL:-canopylabs/orpheus-3b-0.1-ft}"
+            -e "ORPHEUS_GPU_MEMORY_UTILIZATION=${ORPHEUS_GPU_MEMORY_UTILIZATION:-0.25}"
         )
     fi
 
@@ -470,6 +494,99 @@ cmd_restart() {
 }
 
 # =============================================================================
+# Command: bot
+# =============================================================================
+cmd_bot() {
+    check_docker
+
+    if ! is_container_running; then
+        echo "ERROR: Container '$CONTAINER_NAME' is not running"
+        echo "Start it first with './scripts/nemotron.sh start'"
+        exit 1
+    fi
+
+    BOT_NAME="interleaved"
+    BOT_PORT=""
+    BOT_ASR="${ASR_BACKEND:-nemotron}"
+    BOT_FOREGROUND="false"
+
+    if [[ $# -gt 0 ]] && [[ "$1" != --* ]] && [[ "$1" != "-f" ]]; then
+        BOT_NAME="$1"
+        shift
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --port)
+                BOT_PORT="$2"
+                shift 2
+                ;;
+            --asr)
+                BOT_ASR="$2"
+                shift 2
+                ;;
+            --foreground|-f)
+                BOT_FOREGROUND="true"
+                shift
+                ;;
+            *)
+                echo "Unknown bot option: $1"
+                print_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    case "$BOT_NAME" in
+        interleaved)
+            BOT_SCRIPT="pipecat_bots/bot_interleaved_streaming.py"
+            BOT_PORT="${BOT_PORT:-7860}"
+            LOG_FILE="/var/log/nemotron/bot-interleaved.log"
+            ;;
+        tools)
+            BOT_SCRIPT="pipecat_bots/bot_tools_test.py"
+            BOT_PORT="${BOT_PORT:-7861}"
+            LOG_FILE="/var/log/nemotron/bot-tools.log"
+            ;;
+        simple)
+            BOT_SCRIPT="pipecat_bots/bot_simple_vad.py"
+            BOT_PORT="${BOT_PORT:-7860}"
+            LOG_FILE="/var/log/nemotron/bot-simple.log"
+            ;;
+        *)
+            echo "ERROR: Unknown bot: $BOT_NAME"
+            echo "Valid bots: interleaved, tools, simple"
+            exit 1
+            ;;
+    esac
+
+    BOT_ENV="ASR_BACKEND=$BOT_ASR"
+    if [[ "${ENABLE_ASR_DIAGNOSTICS:-false}" == "true" ]]; then
+        BOT_ENV="$BOT_ENV ENABLE_ASR_DIAGNOSTICS=true"
+        BOT_ENV="$BOT_ENV ASR_DIAGNOSTICS_DIR=${ASR_DIAGNOSTICS_DIR:-diagnostics/asr}"
+    fi
+    if [[ "$BOT_ASR" == "voxtral" ]]; then
+        BOT_ENV="$BOT_ENV VOXTRAL_ASR_URL=${VOXTRAL_ASR_URL:-ws://172.17.0.1:8082/v1/realtime}"
+    fi
+
+    BOT_CMD="cd /workspace && $BOT_ENV python $BOT_SCRIPT -t webrtc --host 0.0.0.0 --port $BOT_PORT"
+
+    if [[ "$BOT_FOREGROUND" == "true" ]]; then
+        echo "Starting $BOT_NAME bot in foreground..."
+        echo "ASR backend: $BOT_ASR"
+        echo "Open http://localhost:${BOT_PORT}/client in your browser"
+        docker exec -it "$CONTAINER_NAME" bash -lc "$BOT_CMD"
+    else
+        echo "Starting $BOT_NAME bot in background..."
+        docker exec -d "$CONTAINER_NAME" bash -lc "mkdir -p /var/log/nemotron && $BOT_CMD > $LOG_FILE 2>&1"
+        echo "Bot started."
+        echo "ASR backend: $BOT_ASR"
+        echo "Open http://localhost:${BOT_PORT}/client in your browser"
+        echo "Logs: ./scripts/nemotron.sh logs bot"
+    fi
+}
+
+# =============================================================================
 # Command: status
 # =============================================================================
 cmd_status() {
@@ -518,6 +635,15 @@ cmd_status() {
         else
             echo "    LLM (port 8000): DOWN or DISABLED"
         fi
+
+        # Browser bot health
+        if curl -sf http://localhost:7860/client/ > /dev/null 2>&1; then
+            echo "    WebRTC bot (port 7860): UP"
+        elif curl -sf http://localhost:7861/client/ > /dev/null 2>&1; then
+            echo "    WebRTC bot (port 7861): UP"
+        else
+            echo "    WebRTC bot (ports 7860/7861): DOWN or NOT STARTED"
+        fi
     else
         echo "  Container: STOPPED"
         echo ""
@@ -555,19 +681,24 @@ cmd_logs() {
             ;;
         all)
             echo "=== All Logs (Ctrl+C to exit) ==="
-            echo "  [ASR] = ASR service, [TTS] = TTS service, [LLM] = LLM service"
+            echo "  [ASR] = ASR service, [TTS] = TTS service, [LLM] = LLM service, [BOT] = WebRTC bot"
             echo ""
             # Use tail with headers, interleaved
             docker exec "$CONTAINER_NAME" bash -c '
                 tail -f /var/log/nemotron/asr.log 2>/dev/null | sed "s/^/[ASR] /" &
                 tail -f /var/log/nemotron/tts.log 2>/dev/null | sed "s/^/[TTS] /" &
                 tail -f /var/log/nemotron/llm.log 2>/dev/null | sed "s/^/[LLM] /" &
+                tail -f /var/log/nemotron/bot-*.log 2>/dev/null | sed "s/^/[BOT] /" &
                 wait
             '
             ;;
+        bot)
+            echo "=== Bot Logs (Ctrl+C to exit) ==="
+            docker exec "$CONTAINER_NAME" bash -c 'tail -f /var/log/nemotron/bot-*.log'
+            ;;
         *)
             echo "ERROR: Unknown service: $SERVICE"
-            echo "Valid services: asr, tts, llm, all"
+            echo "Valid services: asr, tts, llm, bot, all"
             exit 1
             ;;
     esac
@@ -603,6 +734,9 @@ case "$COMMAND" in
         ;;
     restart)
         cmd_restart "$@"
+        ;;
+    bot)
+        cmd_bot "$@"
         ;;
     status)
         cmd_status

@@ -70,12 +70,12 @@ def load_audio_file(path: str, target_sample_rate: int = 16000) -> np.ndarray:
             framerate = wf.getframerate()
             raw_data = wf.readframes(wf.getnframes())
     except wave.Error:
-        # Not a WAV file - assume raw PCM (Magpie format: 22kHz mono s16le)
+        # Not a WAV file - assume raw PCM (Orpheus format: 24kHz mono s16le)
         with open(path, "rb") as f:
             raw_data = f.read()
         nchannels = 1
         sampwidth = 2
-        framerate = 22000
+        framerate = 24000
 
     # Convert to numpy array
     if sampwidth == 2:
@@ -329,7 +329,7 @@ class MultiTurnVoiceAgentClient:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{self.tts_url}/v1/audio/speech",
-                json={"input": text, "voice": "aria", "model": "magpie"},
+                json={"input": text, "voice": "tara", "model": "orpheus"},
                 headers={"Content-Type": "application/json"},
             ) as response:
                 if response.status != 200:
@@ -419,13 +419,13 @@ class MultiTurnVoiceAgentClient:
 
 
 async def synthesize_audio(text: str, tts_url: str = "http://localhost:8001") -> str:
-    """Synthesize audio from text using Magpie TTS (standalone function for compatibility)."""
+    """Synthesize audio from text using Orpheus TTS."""
     output_path = f"/tmp/test_audio_{int(time.time() * 1000)}.pcm"
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{tts_url}/v1/audio/speech",
-            json={"input": text, "voice": "aria", "model": "magpie"},
+            json={"input": text, "voice": "tara", "model": "orpheus"},
             headers={"Content-Type": "application/json"},
         ) as response:
             if response.status != 200:

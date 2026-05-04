@@ -6,9 +6,11 @@
 # Uses longer silence threshold (800ms) for more conservative turn detection.
 #
 # Environment variables:
-#   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
+#   ASR_BACKEND           nemotron (default) or voxtral
+#   NVIDIA_ASR_URL        Nemotron ASR WebSocket URL (default: ws://localhost:8080)
+#   VOXTRAL_ASR_URL       Voxtral Realtime URL (default: ws://localhost:8082/v1/realtime)
 #   NVIDIA_LLAMA_CPP_URL  llama.cpp API URL (default: http://localhost:8000)
-#   NVIDIA_TTS_URL        Magpie TTS server URL (default: http://localhost:8001)
+#   NVIDIA_TTS_URL        Orpheus TTS server URL (default: http://localhost:8001)
 #
 # Usage:
 #   uv run pipecat_bots/bot_simple_vad.py
@@ -36,16 +38,29 @@ from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 # Import our custom local services
-from nvidia_stt import NVidiaWebSocketSTTService
-from magpie_websocket_tts import MagpieWebSocketTTSService
+from asr_factory import create_stt_service, describe_asr_backend
+from orpheus_http_tts import OrpheusHTTPTTSService
 from llama_cpp_chunked_llm import LlamaCppChunkedLLMService
 
 load_dotenv(override=True)
 
 # Configuration from environment
-NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
 NVIDIA_LLAMA_CPP_URL = os.getenv("NVIDIA_LLAMA_CPP_URL", "http://localhost:8000")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
+
+VAD_CONFIDENCE = float(os.getenv("VAD_CONFIDENCE", "0.7"))
+VAD_START_SECS = float(os.getenv("VAD_START_SECS", "0.12"))
+VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "0.8"))
+VAD_MIN_VOLUME = float(os.getenv("VAD_MIN_VOLUME", "0.25"))
+
+
+def vad_params() -> VADParams:
+    return VADParams(
+        confidence=VAD_CONFIDENCE,
+        start_secs=VAD_START_SECS,
+        stop_secs=VAD_STOP_SECS,
+        min_volume=VAD_MIN_VOLUME,
+    )
 
 # Transport configurations with SIMPLE VAD only (no SmartTurn)
 # Using stop_secs=0.8 (800ms) for conservative turn detection
@@ -53,19 +68,22 @@ transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
+        vad_audio_passthrough=True,
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         # NO turn_analyzer - just simple VAD
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
+        vad_audio_passthrough=True,
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         # NO turn_analyzer
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
+        vad_audio_passthrough=True,
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
         # NO turn_analyzer
     ),
 }
@@ -73,30 +91,27 @@ transport_params = {
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info("Starting simple VAD bot (NO SmartTurn)")
-    logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
+    logger.info(f"  ASR: {describe_asr_backend()}")
     logger.info(f"  LLM URL: {NVIDIA_LLAMA_CPP_URL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
-    logger.info(f"  VAD: Silero with stop_secs=0.8 (NO SmartTurn)")
+    logger.info(
+        "  VAD: "
+        f"confidence={VAD_CONFIDENCE}, start_secs={VAD_START_SECS}, "
+        f"stop_secs={VAD_STOP_SECS}, min_volume={VAD_MIN_VOLUME} (NO SmartTurn)"
+    )
     logger.info(f"  Transport: {type(transport).__name__}")
 
-    # NVIDIA Parakeet ASR via WebSocket
-    stt = NVidiaWebSocketSTTService(
-        url=NVIDIA_ASR_URL,
-        sample_rate=16000,
-    )
+    stt = create_stt_service(sample_rate=16000)
 
-    # WebSocket Magpie TTS with adaptive mode
-    tts = MagpieWebSocketTTSService(
+    # Orpheus TTS via local HTTP streaming server.
+    tts = OrpheusHTTPTTSService(
         server_url=NVIDIA_TTS_URL,
-        voice="aria",
-        language="en",
-        params=MagpieWebSocketTTSService.InputParams(
+        voice=os.getenv("ORPHEUS_VOICE", "tara"),
+        params=OrpheusHTTPTTSService.InputParams(
             language="en",
-            streaming_preset="conservative",
-            use_adaptive_mode=True,
         ),
     )
-    logger.info("Using WebSocket Magpie TTS (adaptive mode)")
+    logger.info("Using Orpheus HTTP TTS")
 
     # Chunked LLM - sentence-boundary streaming direct to llama.cpp
     llm = LlamaCppChunkedLLMService(
