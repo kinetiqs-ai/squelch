@@ -9,7 +9,7 @@
 # Environment variables:
 #   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
 #   NVIDIA_LLAMA_CPP_URL  llama.cpp API URL (default: http://localhost:8000)
-#   NVIDIA_TTS_URL        Magpie TTS server URL (default: http://localhost:8001)
+#   NVIDIA_TTS_URL        Orpheus TTS server URL (default: http://localhost:8001)
 #   ENABLE_RECORDING      Enable audio recording (default: false)
 #
 # Usage:
@@ -50,7 +50,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 # Import our custom local services
 from nvidia_stt import NVidiaWebSocketSTTService
-from magpie_websocket_tts import MagpieWebSocketTTSService
+from orpheus_http_tts import OrpheusHTTPTTSService
 from llama_cpp_buffered_llm import LlamaCppBufferedLLMService
 from v2v_metrics import V2VMetricsProcessor
 
@@ -146,19 +146,16 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         sample_rate=16000,
     )
 
-    # WebSocket Magpie TTS with adaptive mode
-    # Adaptive mode: streaming for first segment (~370ms TTFB), batch for subsequent (quality)
-    tts = MagpieWebSocketTTSService(
+    # Orpheus TTS via local HTTP streaming server.
+    # The adapter preserves the LLM/TTS continue-frame backpressure contract.
+    tts = OrpheusHTTPTTSService(
         server_url=NVIDIA_TTS_URL,
-        voice="aria",
-        language="en",
-        params=MagpieWebSocketTTSService.InputParams(
+        voice=os.getenv("ORPHEUS_VOICE", "tara"),
+        params=OrpheusHTTPTTSService.InputParams(
             language="en",
-            streaming_preset="conservative",
-            use_adaptive_mode=True,
         ),
     )
-    logger.info("Using WebSocket Magpie TTS (adaptive mode)")
+    logger.info("Using Orpheus HTTP TTS")
 
     # Voice-to-voice response time metrics
     v2v_metrics = V2VMetricsProcessor(vad_stop_secs=VAD_STOP_SECS)

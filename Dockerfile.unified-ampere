@@ -7,7 +7,7 @@
 # Key changes from Dockerfile.unified:
 #   - Base: nvidia/cuda:12.6.3-devel-ubuntu24.04 (was cuda:13.0.0-devel, x86_64 Blackwell)
 #   - cuDNN/NCCL: apt packages (was COPY from Blackwell NGC container nvcr.io/nvidia/pytorch:25.11-py3)
-#   - PyTorch: pre-built cu126 wheel (was ~3-hour source build targeting sm_120)
+#   - PyTorch: pre-built CUDA wheel (was ~3-hour source build targeting sm_120)
 #   - torchaudio: pre-built wheel (was source build)
 #   - vLLM: pre-built pip wheel (was source build with SM121 patches)
 #   - llama.cpp CUDA arch: 80-real (was 120a)
@@ -60,7 +60,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # =============================================================================
 # Phase 2: uv package manager
-# Note: cuDNN is bundled in the torch==2.6.0+cu126 wheel.
+# Note: cuDNN is bundled in the torch==2.6.0 wheel.
 # NCCL is also bundled in the PyTorch wheel (libnccl2/libnccl-dev are held
 # packages in the CUDA base image at the version it ships with; PyTorch's
 # bundled NCCL is what NeMo uses at runtime — no separate apt install needed).
@@ -90,15 +90,15 @@ RUN uv pip install --no-cache \
     pillow
 
 # =============================================================================
-# Phase 5: PyTorch + torchaudio (pre-built cu126 wheels)
+# Phase 5: PyTorch + torchaudio (pre-built CUDA wheels)
 # =============================================================================
-# Pre-built wheels for CUDA 12.6 / Ampere sm_80.
+# Pre-built PyPI wheels include CUDA libraries and support Ampere sm_80.
 # This replaces the 3-hour PyTorch source build from Dockerfile.unified.
 # PyTorch 2.6.0 was released Jan 2025; NeMo Dec 2025 commit is compatible.
 RUN uv pip install --no-cache \
-    torch==2.6.0+cu126 \
-    torchaudio==2.6.0+cu126 \
-    --index-url https://download.pytorch.org/whl/cu126
+    torch==2.6.0 \
+    torchaudio==2.6.0 \
+    torchvision==0.21.0
 
 # Verify GPU visibility
 RUN python3 -c "import torch; assert torch.cuda.is_available() or True, 'torch installed'"
@@ -290,15 +290,14 @@ RUN python3 /tmp/patch_hindi_tokenizer.py
 # =============================================================================
 # Pre-built vLLM for CUDA 12.x has first-class A100 sm_80 support.
 # Replaces the ~45-minute source build + Blackwell-specific patches from Dockerfile.unified.
-RUN uv pip install --no-cache vllm
+# vLLM 0.8.5 pins torch==2.6.0, matching the PyTorch wheel above.
+RUN uv pip install --no-cache vllm==0.8.5
 
-# vLLM upgrades torch to cu130 (e.g. 2.11.0+cu130) which breaks NeMo on CUDA 12.6
-# (NeMo's NVRTC needs libnvrtc-builtins.so.13.0 which doesn't exist in CUDA 12.6).
-# Pin torch back to cu126 after vLLM install.
+# Keep torch pinned to the ABI-compatible wheel after vLLM install.
 RUN uv pip install --no-cache \
-    torch==2.6.0+cu126 \
-    torchaudio==2.6.0+cu126 \
-    --index-url https://download.pytorch.org/whl/cu126
+    torch==2.6.0 \
+    torchaudio==2.6.0 \
+    torchvision==0.21.0
 
 # =============================================================================
 # Phase 8: llama.cpp from source (required for hybrid-cache-fix patch)
@@ -315,6 +314,8 @@ COPY patches/llama-cpp-hybrid-cache-fix.patch /tmp/llama-cpp-hybrid-cache-fix.pa
 
 RUN CUDA_ARCH="80-real" && \
     echo "=== Building llama.cpp for x86_64 with CUDA arch ${CUDA_ARCH} ===" && \
+    ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}" && \
     git clone https://github.com/ggerganov/llama.cpp.git /opt/llama.cpp && \
     cd /opt/llama.cpp && git checkout ${LLAMACPP_COMMIT} && \
     echo "=== Applying hybrid cache fix patch ===" && \
@@ -323,13 +324,14 @@ RUN CUDA_ARCH="80-real" && \
         -DGGML_CUDA=ON \
         -DGGML_CUDA_F16=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -L/usr/local/cuda/lib64/stubs" \
         -DCMAKE_BUILD_TYPE=Release && \
     cmake --build build --config Release -j$(nproc) && \
     cp build/bin/llama-server /usr/local/bin/ && \
     cp build/bin/llama-cli /usr/local/bin/ && \
     cp build/bin/llama-quantize /usr/local/bin/ && \
     cp build/bin/llama-bench /usr/local/bin/ && \
-    cp build/bin/*.so* /usr/local/lib/ 2>/dev/null || true && \
+    { cp build/bin/*.so* /usr/local/lib/ 2>/dev/null || true; } && \
     ldconfig && \
     rm -rf /opt/llama.cpp/build && \
     rm -rf /opt/llama.cpp/.git
@@ -343,8 +345,13 @@ RUN which llama-server && echo "llama-server installed at $(which llama-server)"
 # =============================================================================
 RUN uv pip install --no-cache \
     websockets>=12.0 \
+    fastapi>=0.110.0 \
+    uvicorn>=0.27.0 \
     loguru>=0.7.0 \
-    httpx>=0.25.0
+    httpx>=0.25.0 \
+    python-dotenv>=1.0.0 \
+    snac>=1.2.0 \
+    transformers>=4.36.0
 
 # =============================================================================
 # Phase 10: Application Code
