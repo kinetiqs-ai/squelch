@@ -8,8 +8,8 @@ echo "Starting ASR server on port 8080..."
 python -m nemotron_speech.server --port 8080 &
 ASR_PID=$!
 
-echo "Starting TTS server on port 8001..."
-python -m nemotron_speech.tts_server --port 8001 &
+echo "Starting Orpheus TTS server on port 8001..."
+python -m nemotron_speech.orpheus_tts_server --port 8001 &
 TTS_PID=$!
 
 echo "Both servers started. ASR PID=$ASR_PID, TTS PID=$TTS_PID"

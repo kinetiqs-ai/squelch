@@ -12,7 +12,7 @@ class ChunkedLLMContinueGenerationFrame(SystemFrame):
     This frame tells the LLM service that TTS has finished processing
     the current chunk and generation can continue to the next chunk.
 
-    Used by both LlamaCppBufferedLLMService and MagpieWebSocketTTSService
+    Used by both LlamaCppBufferedLLMService and local streaming TTS services.
     for synchronization between LLM generation and TTS synthesis.
     """
 
