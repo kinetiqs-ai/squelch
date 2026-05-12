@@ -8,5 +8,7 @@ exec uv run \
   --with fastapi \
   --with "uvicorn[standard]" \
   --with nvidia-riva-client \
+  --with webrtcvad \
+  --with "setuptools<81" \
   --with "audio-edge-agent @ file:///home/ramp-genesis/audio-edge-agent" \
   python -m native_voice.riva_asr_app --host 127.0.0.1 --port 7860

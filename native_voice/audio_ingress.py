@@ -8,12 +8,18 @@ import logging
 import queue
 import threading
 import time
+import warnings
 import wave
 from collections.abc import Iterable
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import riva.client
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message="pkg_resources is deprecated.*", category=UserWarning)
+    import webrtcvad
 from audio_edge_agent.protocol import (
     CHANNELS,
     FRAME_DURATION_MS,
@@ -40,7 +46,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from native_voice.diagnostics import SessionDiagnostics
 from native_voice.riva_pipeline import (
-    LEADING_SILENCE_MS,
     RIVA_CHUNK_BYTES,
     RIVA_CHUNK_FRAMES,
     SAMPLE_RATE_HZ,
@@ -57,6 +62,90 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 EDGE_FRAMES_PER_RIVA_CHUNK = RIVA_CHUNK_BYTES // FRAME_SIZE_BYTES
 if RIVA_CHUNK_BYTES % FRAME_SIZE_BYTES:
     raise RuntimeError("Riva chunk size must be an integer multiple of edge frames")
+
+
+@dataclass
+class VadDecision:
+    voiced: bool
+    rms: float
+    state: str
+    feed_frames: list[bytes]
+    transition: str | None = None
+
+
+class VadGate:
+    def __init__(
+        self,
+        aggressiveness: int = 3,
+        preroll_frames: int = 25,
+        start_window_frames: int = 8,
+        start_voiced_frames: int = 4,
+        end_silence_frames: int = 35,
+        rms_start_threshold: float = 0.004,
+    ) -> None:
+        self._vad = webrtcvad.Vad(aggressiveness)
+        self._preroll: deque[bytes] = deque(maxlen=preroll_frames)
+        self._recent_voiced: deque[bool] = deque(maxlen=start_window_frames)
+        self._start_voiced_frames = start_voiced_frames
+        self._end_silence_frames = end_silence_frames
+        self._rms_start_threshold = rms_start_threshold
+        self._active = False
+        self._silence_frames = 0
+        self.speech_segments = 0
+        self.voiced_frames = 0
+        self.unvoiced_frames = 0
+        self.asr_frames = 0
+
+    @property
+    def state(self) -> str:
+        return "speech" if self._active else "idle"
+
+    def process(self, payload: bytes) -> VadDecision:
+        rms = _pcm_rms(payload)
+        voiced = self._vad.is_speech(payload, SAMPLE_RATE) and rms >= self._rms_start_threshold
+        if voiced:
+            self.voiced_frames += 1
+        else:
+            self.unvoiced_frames += 1
+
+        feed_frames: list[bytes] = []
+        transition: str | None = None
+
+        if not self._active:
+            self._preroll.append(payload)
+            self._recent_voiced.append(voiced)
+            if sum(self._recent_voiced) >= self._start_voiced_frames:
+                self._active = True
+                self._silence_frames = 0
+                self.speech_segments += 1
+                transition = "speech_start"
+                feed_frames.extend(self._preroll)
+                self._preroll.clear()
+            self.asr_frames += len(feed_frames)
+            return VadDecision(voiced, rms, self.state, feed_frames, transition)
+
+        feed_frames.append(payload)
+        if voiced:
+            self._silence_frames = 0
+        else:
+            self._silence_frames += 1
+            if self._silence_frames >= self._end_silence_frames:
+                self._active = False
+                self._silence_frames = 0
+                self._recent_voiced.clear()
+                self._preroll.clear()
+                transition = "speech_end"
+
+        self.asr_frames += len(feed_frames)
+        return VadDecision(voiced, rms, self.state, feed_frames, transition)
+
+
+def _pcm_rms(payload: bytes) -> float:
+    samples = memoryview(payload).cast("h")
+    if not samples:
+        return 0.0
+    total = sum(int(sample) * int(sample) for sample in samples)
+    return (total / len(samples)) ** 0.5 / 32768.0
 
 
 def _decode_json_message(text: str) -> dict[str, Any]:
@@ -115,6 +204,7 @@ class RivaWorker:
         outbound: asyncio.Queue[str | bytes | None],
         diagnostics: SessionDiagnostics,
         started_at: float,
+        leading_silence_ms: int = 0,
     ) -> None:
         self.session_id = session_id
         self.audio_queue = audio_queue
@@ -122,6 +212,7 @@ class RivaWorker:
         self.outbound = outbound
         self.diagnostics = diagnostics
         self.started_at = started_at
+        self.leading_silence_ms = leading_silence_ms
         self.stop_event = threading.Event()
         self.assembler = TranscriptAssembler()
         self.thread = threading.Thread(target=self._run, name="riva-audio-ingress-worker", daemon=True)
@@ -151,13 +242,14 @@ class RivaWorker:
             pass
 
     def _audio_chunks(self) -> Iterable[bytes]:
-        silence_chunks = max(
-            1,
-            round((LEADING_SILENCE_MS / 1000) * SAMPLE_RATE_HZ / RIVA_CHUNK_FRAMES),
-        )
-        silence = b"\x00\x00" * RIVA_CHUNK_FRAMES
-        for _ in range(silence_chunks):
-            yield silence
+        if self.leading_silence_ms > 0:
+            silence_chunks = max(
+                1,
+                round((self.leading_silence_ms / 1000) * SAMPLE_RATE_HZ / RIVA_CHUNK_FRAMES),
+            )
+            silence = b"\x00\x00" * RIVA_CHUNK_FRAMES
+            for _ in range(silence_chunks):
+                yield silence
 
         pending: list[bytes] = []
         while not self.stop_event.is_set():
@@ -247,6 +339,7 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
     started_at = time.monotonic()
     audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=500)
     outbound: asyncio.Queue[str | bytes | None] = asyncio.Queue(maxsize=500)
+    vad_gate = VadGate()
     worker = RivaWorker(
         session_id=session_id,
         audio_queue=audio_queue,
@@ -254,6 +347,7 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
         outbound=outbound,
         diagnostics=diagnostics,
         started_at=started_at,
+        leading_silence_ms=0,
     )
     worker.start()
 
@@ -359,6 +453,7 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
                 last_sequence = header.sequence
                 last_receive_us = receive_us
                 frame_count += 1
+                vad = vad_gate.process(payload)
 
                 diagnostics.write_audio(payload)
                 diagnostics.transport.write(
@@ -372,20 +467,37 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
                         "payload_length": len(payload),
                         "sequence_gap": gap,
                         "audio_queue_size": audio_queue.qsize(),
+                        "vad_voiced": vad.voiced,
+                        "vad_rms": round(vad.rms, 6),
+                        "vad_state": vad.state,
+                        "vad_transition": vad.transition,
+                        "asr_feed_frames": len(vad.feed_frames),
                     }
                 )
-                try:
-                    audio_queue.put_nowait(payload)
-                except queue.Full:
-                    queue_drops += 1
+                if vad.transition is not None:
                     diagnostics.transport.write(
                         {
-                            "type": "queue_drop",
+                            "type": "vad_transition",
+                            "transition": vad.transition,
                             "frame_count": frame_count,
                             "sequence": header.sequence,
                             "receiver_timestamp_us": receive_us,
+                            "rms": round(vad.rms, 6),
                         }
                     )
+                for asr_payload in vad.feed_frames:
+                    try:
+                        audio_queue.put_nowait(asr_payload)
+                    except queue.Full:
+                        queue_drops += 1
+                        diagnostics.transport.write(
+                            {
+                                "type": "queue_drop",
+                                "frame_count": frame_count,
+                                "sequence": header.sequence,
+                                "receiver_timestamp_us": receive_us,
+                            }
+                        )
                 continue
 
             text = message.get("text")
@@ -482,6 +594,10 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
                 "frames_received": frame_count,
                 "sequence_gap_events": sequence_gaps,
                 "queue_drops": queue_drops,
+                "vad_speech_segments": vad_gate.speech_segments,
+                "vad_voiced_frames": vad_gate.voiced_frames,
+                "vad_unvoiced_frames": vad_gate.unvoiced_frames,
+                "asr_frames_fed": vad_gate.asr_frames,
                 "asr_committed_text": worker.assembler.committed_text,
                 "asr_event_count": worker.assembler.event_id,
             }
