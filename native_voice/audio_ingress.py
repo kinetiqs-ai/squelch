@@ -20,6 +20,7 @@ from audio_edge_agent.protocol import (
     PROTOCOL_VERSION,
     SAMPLE_FORMAT,
     SAMPLE_RATE,
+    AsrTranscriptEvent,
     AudioStart,
     AudioStop,
     ErrorCode,
@@ -103,11 +104,17 @@ def _protocol_error_code(exc: ProtocolError) -> ErrorCode:
 class RivaWorker:
     def __init__(
         self,
+        session_id: str,
         audio_queue: queue.Queue[bytes | None],
+        event_loop: asyncio.AbstractEventLoop,
+        outbound: asyncio.Queue[str | None],
         diagnostics: SessionDiagnostics,
         started_at: float,
     ) -> None:
+        self.session_id = session_id
         self.audio_queue = audio_queue
+        self.event_loop = event_loop
+        self.outbound = outbound
         self.diagnostics = diagnostics
         self.started_at = started_at
         self.stop_event = threading.Event()
@@ -171,6 +178,7 @@ class RivaWorker:
             for response in responses:
                 for message in transcript_messages(response, self.started_at, self.assembler):
                     self.diagnostics.asr.write(message)
+                    self._emit_transcript_event(message)
                     logger.info(
                         "audio_ingress_asr seq=%s final=%s elapsed_ms=%s text=%r committed=%r",
                         message["sequence"],
@@ -189,10 +197,31 @@ class RivaWorker:
             )
             logger.exception("audio_ingress_riva_worker_failed")
 
+    def _emit_transcript_event(self, message: dict[str, Any]) -> None:
+        event = AsrTranscriptEvent(
+            session_id=self.session_id,
+            text=message["text"],
+            final=bool(message["final"]),
+            sequence=int(message["sequence"]),
+            elapsed_ms=message.get("elapsed_ms"),
+            confidence=message.get("confidence"),
+            stability=message.get("stability"),
+        )
+        payload = event.to_json_bytes().decode()
+
+        def enqueue() -> None:
+            try:
+                self.outbound.put_nowait(payload)
+            except asyncio.QueueFull:
+                logger.warning("audio_ingress_outbound_event_queue_full session=%s", self.session_id)
+
+        self.event_loop.call_soon_threadsafe(enqueue)
+
 
 @router.websocket("/ws/audio-ingress")
 async def websocket_audio_ingress(websocket: WebSocket) -> None:
     await websocket.accept()
+    loop = asyncio.get_running_loop()
 
     first = await websocket.receive()
     first_text = first.get("text")
@@ -212,8 +241,25 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
     diagnostics = SessionDiagnostics(session_id=session_id)
     started_at = time.monotonic()
     audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=500)
-    worker = RivaWorker(audio_queue=audio_queue, diagnostics=diagnostics, started_at=started_at)
+    outbound: asyncio.Queue[str | None] = asyncio.Queue(maxsize=500)
+    worker = RivaWorker(
+        session_id=session_id,
+        audio_queue=audio_queue,
+        event_loop=loop,
+        outbound=outbound,
+        diagnostics=diagnostics,
+        started_at=started_at,
+    )
     worker.start()
+
+    async def sender() -> None:
+        while True:
+            payload = await outbound.get()
+            if payload is None:
+                return
+            await websocket.send_text(payload)
+
+    sender_task = asyncio.create_task(sender())
 
     frame_count = 0
     sequence_gaps = 0
@@ -392,9 +438,23 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
                 await _send_error(websocket, ErrorCode.BAD_MESSAGE_TYPE, str(exc), session_id)
     except WebSocketDisconnect:
         closed_reason = "disconnect"
+    except RuntimeError as exc:
+        if "disconnect message" not in str(exc):
+            raise
+        closed_reason = "disconnect"
     finally:
         worker.finish(drain=closed_reason == "audio_stop")
         await asyncio.to_thread(worker.join, 10.0)
+        try:
+            outbound.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+        try:
+            await asyncio.wait_for(sender_task, timeout=3.0)
+        except asyncio.TimeoutError:
+            sender_task.cancel()
+        except Exception:
+            sender_task.cancel()
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         diagnostics.write_summary(
             {
