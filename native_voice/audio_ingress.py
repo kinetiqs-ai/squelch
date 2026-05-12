@@ -63,6 +63,8 @@ EDGE_FRAMES_PER_RIVA_CHUNK = RIVA_CHUNK_BYTES // FRAME_SIZE_BYTES
 if RIVA_CHUNK_BYTES % FRAME_SIZE_BYTES:
     raise RuntimeError("Riva chunk size must be an integer multiple of edge frames")
 
+_SEGMENT_END = object()
+
 
 @dataclass
 class VadDecision:
@@ -199,7 +201,7 @@ class RivaWorker:
     def __init__(
         self,
         session_id: str,
-        audio_queue: queue.Queue[bytes | None],
+        audio_queue: queue.Queue[bytes | object | None],
         event_loop: asyncio.AbstractEventLoop,
         outbound: asyncio.Queue[str | bytes | None],
         diagnostics: SessionDiagnostics,
@@ -241,7 +243,7 @@ class RivaWorker:
         except queue.Full:
             pass
 
-    def _audio_chunks(self) -> Iterable[bytes]:
+    def _audio_chunks(self, first_payload: bytes) -> Iterable[bytes]:
         if self.leading_silence_ms > 0:
             silence_chunks = max(
                 1,
@@ -251,48 +253,59 @@ class RivaWorker:
             for _ in range(silence_chunks):
                 yield silence
 
-        pending: list[bytes] = []
+        pending: list[bytes] = [first_payload]
         while not self.stop_event.is_set():
-            payload = self.audio_queue.get()
-            if payload is None:
-                break
-            pending.append(payload)
-            if len(pending) == EDGE_FRAMES_PER_RIVA_CHUNK:
+            while len(pending) < EDGE_FRAMES_PER_RIVA_CHUNK:
+                payload = self.audio_queue.get()
+                if payload is None:
+                    self.stop_event.set()
+                    break
+                if payload is _SEGMENT_END:
+                    break
+                pending.append(payload)
+
+            if pending:
                 yield b"".join(pending)
                 pending.clear()
 
-        if pending:
-            yield b"".join(pending)
+            if self.stop_event.is_set() or payload is _SEGMENT_END:
+                break
 
     def _run(self) -> None:
-        try:
-            auth = riva.client.Auth(uri="localhost:50051")
-            asr_service = riva.client.ASRService(auth)
-            responses = asr_service.streaming_response_generator(
-                audio_chunks=self._audio_chunks(),
-                streaming_config=build_streaming_config(),
-            )
-            for response in responses:
-                for message in transcript_messages(response, self.started_at, self.assembler):
-                    self.diagnostics.asr.write(message)
-                    self._emit_transcript_event(message)
-                    logger.info(
-                        "audio_ingress_asr seq=%s final=%s elapsed_ms=%s text=%r committed=%r",
-                        message["sequence"],
-                        message["final"],
-                        message["elapsed_ms"],
-                        message["text"],
-                        message["committed_text"],
-                    )
-        except Exception as exc:  # noqa: BLE001 - diagnostics should capture service failures.
-            self.diagnostics.asr.write(
-                {
-                    "type": "error",
-                    "message": str(exc),
-                    "elapsed_ms": int((time.monotonic() - self.started_at) * 1000),
-                }
-            )
-            logger.exception("audio_ingress_riva_worker_failed")
+        auth = riva.client.Auth(uri="localhost:50051")
+        asr_service = riva.client.ASRService(auth)
+        while not self.stop_event.is_set():
+            first_payload = self.audio_queue.get()
+            if first_payload is None:
+                break
+            if first_payload is _SEGMENT_END:
+                continue
+            try:
+                responses = asr_service.streaming_response_generator(
+                    audio_chunks=self._audio_chunks(first_payload),
+                    streaming_config=build_streaming_config(),
+                )
+                for response in responses:
+                    for message in transcript_messages(response, self.started_at, self.assembler):
+                        self.diagnostics.asr.write(message)
+                        self._emit_transcript_event(message)
+                        logger.info(
+                            "audio_ingress_asr seq=%s final=%s elapsed_ms=%s text=%r committed=%r",
+                            message["sequence"],
+                            message["final"],
+                            message["elapsed_ms"],
+                            message["text"],
+                            message["committed_text"],
+                        )
+            except Exception as exc:  # noqa: BLE001 - diagnostics should capture service failures.
+                self.diagnostics.asr.write(
+                    {
+                        "type": "error",
+                        "message": str(exc),
+                        "elapsed_ms": int((time.monotonic() - self.started_at) * 1000),
+                    }
+                )
+                logger.exception("audio_ingress_riva_worker_failed")
 
     def _emit_transcript_event(self, message: dict[str, Any]) -> None:
         event = AsrTranscriptEvent(
@@ -337,7 +350,7 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
     session_id = audio_start.session_id
     diagnostics = SessionDiagnostics(session_id=session_id)
     started_at = time.monotonic()
-    audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=500)
+    audio_queue: queue.Queue[bytes | object | None] = queue.Queue(maxsize=500)
     outbound: asyncio.Queue[str | bytes | None] = asyncio.Queue(maxsize=500)
     vad_gate = VadGate()
     worker = RivaWorker(
@@ -496,6 +509,20 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
                                 "frame_count": frame_count,
                                 "sequence": header.sequence,
                                 "receiver_timestamp_us": receive_us,
+                            }
+                        )
+                if vad.transition == "speech_end":
+                    try:
+                        audio_queue.put_nowait(_SEGMENT_END)
+                    except queue.Full:
+                        queue_drops += 1
+                        diagnostics.transport.write(
+                            {
+                                "type": "queue_drop",
+                                "frame_count": frame_count,
+                                "sequence": header.sequence,
+                                "receiver_timestamp_us": receive_us,
+                                "reason": "segment_end",
                             }
                         )
                 continue
