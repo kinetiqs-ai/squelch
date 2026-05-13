@@ -68,6 +68,7 @@ WEBSOCKET_PLANNING.md
 
 # Test outputs
 tests/fixtures/output/
+runs/
 test_outputs/
 diagnostics/
 

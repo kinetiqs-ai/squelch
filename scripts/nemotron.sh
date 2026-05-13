@@ -56,7 +56,12 @@ DEFAULT_VLLM_FP8_MODEL="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
 
 # HuggingFace model cache paths for ASR and TTS (auto-downloaded on first run)
 HF_CACHE_ASR="$HOME/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b"
-HF_CACHE_TTS="$HOME/.cache/huggingface/hub/models--canopylabs--orpheus-3b-0.1-ft"
+TTS_ENGINE="${TTS_ENGINE:-orpheus}"
+if [[ "$TTS_ENGINE" == "magpie" ]]; then
+    HF_CACHE_TTS="$HOME/.cache/huggingface/hub/models--nvidia--magpie_tts_multilingual_357m"
+else
+    HF_CACHE_TTS="$HOME/.cache/huggingface/hub/models--canopylabs--orpheus-3b-0.1-ft"
+fi
 
 # Auto-detect LLM mode based on available models (prefer Q8 if available)
 if [[ -n "$DEFAULT_Q8_MODEL" ]]; then
@@ -99,6 +104,7 @@ Start Options:
 Bot Options:
   BOT                 interleaved (default), tools, or simple
   --port PORT         WebRTC runner port (default: 7860; tools defaults to 7861)
+  --host HOST         WebRTC bind host (default: 0.0.0.0)
   --asr BACKEND       ASR backend for bot: nemotron (default) or voxtral
   --foreground, -f    Attach to bot logs instead of starting in background
 
@@ -129,6 +135,7 @@ Environment Variables:
   NEMOTRON_CONTAINER_NAME   Container name (default: nemotron)
   NEMOTRON_IMAGE            Docker image (default: nemotron-unified:ampere)
   HUGGINGFACE_ACCESS_TOKEN  HuggingFace token for gated models
+  TTS_ENGINE                TTS service to start: orpheus (default) or magpie
   ORPHEUS_MODEL             Orpheus TTS model (default: canopylabs/orpheus-3b-0.1-ft)
   ORPHEUS_VOICE             Orpheus voice used by bots (default: tara)
 EOF
@@ -352,6 +359,7 @@ cmd_start() {
             -e "HF_HOME=/root/.cache/huggingface"
             -e "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
             -e "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}"
+            -e "TTS_ENGINE=$TTS_ENGINE"
             -e "ORPHEUS_MODEL=${ORPHEUS_MODEL:-canopylabs/orpheus-3b-0.1-ft}"
             -e "ORPHEUS_GPU_MEMORY_UTILIZATION=${ORPHEUS_GPU_MEMORY_UTILIZATION:-0.25}"
         )
@@ -376,9 +384,33 @@ cmd_start() {
             -e "HF_HOME=/root/.cache/huggingface"
             -e "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
             -e "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}"
+            -e "TTS_ENGINE=$TTS_ENGINE"
             -e "ORPHEUS_MODEL=${ORPHEUS_MODEL:-canopylabs/orpheus-3b-0.1-ft}"
             -e "ORPHEUS_GPU_MEMORY_UTILIZATION=${ORPHEUS_GPU_MEMORY_UTILIZATION:-0.25}"
         )
+    fi
+
+    # Magpie batch/streaming TTS defaults for the Thor quality baseline. These
+    # are harmless when TTS_ENGINE=orpheus and keep Magpie runs reproducible.
+    DOCKER_ARGS+=(-e "MAGPIE_SAMPLE_RATE=${MAGPIE_SAMPLE_RATE:-22050}")
+    DOCKER_ARGS+=(-e "MAGPIE_APPLY_TN=${MAGPIE_APPLY_TN:-true}")
+    if [[ -n "${MAGPIE_USE_CFG:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_USE_CFG=$MAGPIE_USE_CFG")
+    fi
+    if [[ -n "${MAGPIE_MODEL:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_MODEL=$MAGPIE_MODEL")
+    fi
+    if [[ -n "${MAGPIE_MODEL_REVISION:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_MODEL_REVISION=$MAGPIE_MODEL_REVISION")
+    fi
+    if [[ -n "${MAGPIE_MODEL_FILENAME:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_MODEL_FILENAME=$MAGPIE_MODEL_FILENAME")
+    fi
+    if [[ -n "${MAGPIE_WARMUP_STREAMING:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_WARMUP_STREAMING=$MAGPIE_WARMUP_STREAMING")
+    fi
+    if [[ -n "${TTS_WARMUP_TEXT:-}" ]]; then
+        DOCKER_ARGS+=(-e "TTS_WARMUP_TEXT=$TTS_WARMUP_TEXT")
     fi
 
     # Add HuggingFace token if set
@@ -507,6 +539,7 @@ cmd_bot() {
 
     BOT_NAME="interleaved"
     BOT_PORT=""
+    BOT_HOST="${BOT_HOST:-0.0.0.0}"
     BOT_ASR="${ASR_BACKEND:-nemotron}"
     BOT_FOREGROUND="false"
 
@@ -519,6 +552,10 @@ cmd_bot() {
         case $1 in
             --port)
                 BOT_PORT="$2"
+                shift 2
+                ;;
+            --host)
+                BOT_HOST="$2"
                 shift 2
                 ;;
             --asr)
@@ -561,6 +598,16 @@ cmd_bot() {
     esac
 
     BOT_ENV="ASR_BACKEND=$BOT_ASR"
+    BOT_ENV="$BOT_ENV TTS_BACKEND=${TTS_BACKEND:-orpheus_http}"
+    BOT_ENV="$BOT_ENV MAGPIE_VOICE=${MAGPIE_VOICE:-aria}"
+    BOT_ENV="$BOT_ENV ORPHEUS_VOICE=${ORPHEUS_VOICE:-tara}"
+    BOT_ENV="$BOT_ENV VAD_STOP_SECS=${VAD_STOP_SECS:-0.34}"
+    BOT_ENV="$BOT_ENV VAD_START_SECS=${VAD_START_SECS:-0.12}"
+    BOT_ENV="$BOT_ENV VAD_CONFIDENCE=${VAD_CONFIDENCE:-0.65}"
+    BOT_ENV="$BOT_ENV VAD_MIN_VOLUME=${VAD_MIN_VOLUME:-0.5}"
+    BOT_ENV="$BOT_ENV USE_SMART_TURN=${USE_SMART_TURN:-false}"
+    BOT_ENV="$BOT_ENV NVIDIA_TTS_URL=${NVIDIA_TTS_URL:-http://localhost:8001}"
+    BOT_ENV="$BOT_ENV NVIDIA_LLAMA_CPP_URL=${NVIDIA_LLAMA_CPP_URL:-http://localhost:8000}"
     if [[ "${ENABLE_ASR_DIAGNOSTICS:-false}" == "true" ]]; then
         BOT_ENV="$BOT_ENV ENABLE_ASR_DIAGNOSTICS=true"
         BOT_ENV="$BOT_ENV ASR_DIAGNOSTICS_DIR=${ASR_DIAGNOSTICS_DIR:-diagnostics/asr}"
@@ -569,18 +616,23 @@ cmd_bot() {
         BOT_ENV="$BOT_ENV VOXTRAL_ASR_URL=${VOXTRAL_ASR_URL:-ws://172.17.0.1:8082/v1/realtime}"
     fi
 
-    BOT_CMD="cd /workspace && $BOT_ENV python $BOT_SCRIPT -t webrtc --host 0.0.0.0 --port $BOT_PORT"
+    BOT_CMD="cd /workspace && $BOT_ENV python $BOT_SCRIPT -t webrtc --host $BOT_HOST --port $BOT_PORT"
 
     if [[ "$BOT_FOREGROUND" == "true" ]]; then
         echo "Starting $BOT_NAME bot in foreground..."
         echo "ASR backend: $BOT_ASR"
+        echo "TTS backend: ${TTS_BACKEND:-orpheus_http}"
+        echo "Bind: $BOT_HOST:$BOT_PORT"
         echo "Open http://localhost:${BOT_PORT}/client in your browser"
         docker exec -it "$CONTAINER_NAME" bash -lc "$BOT_CMD"
     else
         echo "Starting $BOT_NAME bot in background..."
+        docker exec "$CONTAINER_NAME" bash -lc "pkill -f '[p]ipecat_bots/.*\\.py -t webrtc' 2>/dev/null || true"
         docker exec -d "$CONTAINER_NAME" bash -lc "mkdir -p /var/log/nemotron && $BOT_CMD > $LOG_FILE 2>&1"
         echo "Bot started."
         echo "ASR backend: $BOT_ASR"
+        echo "TTS backend: ${TTS_BACKEND:-orpheus_http}"
+        echo "Bind: $BOT_HOST:$BOT_PORT"
         echo "Open http://localhost:${BOT_PORT}/client in your browser"
         echo "Logs: ./scripts/nemotron.sh logs bot"
     fi

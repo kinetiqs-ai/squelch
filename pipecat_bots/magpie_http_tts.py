@@ -1,14 +1,8 @@
-"""HTTP client for Magpie TTS server.
-
-Connects to the Magpie TTS HTTP server for speech synthesis.
-Runs on the host - no NeMo/PyTorch dependencies required.
-
-Usage:
-    tts = MagpieHTTPTTSService(server_url="http://localhost:8001")
-    # In pipeline: ... -> llm -> tts -> transport.output() -> ...
-"""
+"""Pipecat TTS service for the local Magpie HTTP batch server."""
 
 import asyncio
+import re
+import time
 from typing import AsyncGenerator, Optional
 
 import httpx
@@ -16,29 +10,66 @@ from loguru import logger
 from pydantic import BaseModel
 
 from pipecat.frames.frames import (
+    CancelFrame,
     ErrorFrame,
     Frame,
+    InterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import TTSService
 
-# Default sample rate (will be fetched from server)
-DEFAULT_SAMPLE_RATE = 22000
+try:
+    from pipecat_bots.frames import ChunkedLLMContinueGenerationFrame
+except ModuleNotFoundError:
+    from frames import ChunkedLLMContinueGenerationFrame
+
+
+DEFAULT_SAMPLE_RATE = 22050
+
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FA6F"
+    "\U0001FA70-\U0001FAFF"
+    "\U00002702-\U000027B0"
+    "\U0001F1E0-\U0001F1FF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def sanitize_text_for_tts(text: str) -> str:
+    text = EMOJI_PATTERN.sub("", text)
+    text = text.replace("\u2018", "'")
+    text = text.replace("\u2019", "'")
+    text = text.replace("\u201C", '"')
+    text = text.replace("\u201D", '"')
+    text = text.replace("\u2014", "-")
+    text = text.replace("\u2013", "-")
+    return text.strip()
 
 
 class MagpieHTTPTTSService(TTSService):
-    """HTTP client for Magpie TTS server.
+    """Fetch complete sentence audio from Magpie's batch endpoint.
 
-    Connects to a local Magpie TTS HTTP server for speech synthesis.
-    No NeMo/PyTorch dependencies - runs on host.
+    Batch sentence synthesis is deliberate for the Thor bring-up path. It avoids
+    the old frame-level decode stitching that caused audible boundary artifacts.
     """
 
     class InputParams(BaseModel):
         """Input parameters for Magpie HTTP TTS."""
 
         language: str = "en"
+        request_timeout_s: float = 120.0
 
     def __init__(
         self,
@@ -59,8 +90,11 @@ class MagpieHTTPTTSService(TTSService):
             sample_rate: Output sample rate (default: fetched from server)
             params: Additional TTS parameters.
         """
-        # Will update sample_rate after fetching from server
-        super().__init__(sample_rate=sample_rate or DEFAULT_SAMPLE_RATE, **kwargs)
+        super().__init__(
+            sample_rate=sample_rate or DEFAULT_SAMPLE_RATE,
+            aggregate_sentences=False,
+            **kwargs,
+        )
 
         params = params or MagpieHTTPTTSService.InputParams()
 
@@ -68,9 +102,11 @@ class MagpieHTTPTTSService(TTSService):
         self._voice = voice.lower()
         self._language = language.lower()
         self._sample_rate = sample_rate
+        self._params = params
+        self._generation_id = 0
 
         # HTTP client with connection pooling
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=params.request_timeout_s)
         self._config_fetched = False
 
         self.set_model_name("magpie-http")
@@ -111,6 +147,21 @@ class MagpieHTTPTTSService(TTSService):
         """Check if this service can generate processing metrics."""
         return True
 
+    async def cancel(self, frame: CancelFrame):
+        self._generation_id += 1
+        logger.info(f"MagpieHTTPTTS: cancel current_generation={self._generation_id}")
+        await self.stop_all_metrics()
+        await super().cancel(frame)
+
+    async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
+        self._generation_id += 1
+        logger.info(
+            f"MagpieHTTPTTS: interruption current_generation={self._generation_id} "
+            f"direction={direction.name}"
+        )
+        await self.stop_all_metrics()
+        await super()._handle_interruption(frame, direction)
+
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
         """Generate speech from text using Magpie TTS HTTP server.
 
@@ -120,42 +171,56 @@ class MagpieHTTPTTSService(TTSService):
         Yields:
             TTSStartedFrame, TTSAudioRawFrame, TTSStoppedFrame
         """
-        await self.start_ttfb_metrics()
-        yield TTSStartedFrame()
+        text = sanitize_text_for_tts(text)
+        if not text:
+            return
+
+        self._generation_id += 1
+        generation_id = self._generation_id
 
         # Fetch config on first request
         await self._ensure_config()
 
-        # Normalize unicode characters
-        text = text.replace("\u2018", "'")  # LEFT SINGLE QUOTATION MARK
-        text = text.replace("\u2019", "'")  # RIGHT SINGLE QUOTATION MARK
-        text = text.replace("\u201C", '"')  # LEFT DOUBLE QUOTATION MARK
-        text = text.replace("\u201D", '"')  # RIGHT DOUBLE QUOTATION MARK
-        text = text.replace("\u2014", "-")  # EM DASH
-        text = text.replace("\u2013", "-")  # EN DASH
-
-        logger.debug(f"MagpieHTTPTTS: Generating [{text[:50]}...]")
+        await self.start_ttfb_metrics()
+        logger.info(
+            f"MagpieHTTPTTS: request_start generation={generation_id} "
+            f"chars={len(text)} text={text!r}"
+        )
+        yield TTSStartedFrame()
 
         try:
             # Make HTTP request to TTS server
+            request_started = time.time()
             resp = await self._client.post(
                 f"{self._server_url}/v1/audio/speech",
                 json={
                     "input": text,
                     "voice": self._voice,
-                    "language": self._language,
+                    "language": self._params.language,
                     "response_format": "pcm",
                 },
+            )
+            request_elapsed_ms = (time.time() - request_started) * 1000
+            logger.info(
+                f"MagpieHTTPTTS: response_status generation={generation_id} "
+                f"status={resp.status_code} elapsed_ms={request_elapsed_ms:.0f} "
+                f"rtf={resp.headers.get('X-RTF')} "
+                f"duration_ms={resp.headers.get('X-Duration-Ms')}"
             )
 
             if resp.status_code != 200:
                 error_msg = f"TTS server error: {resp.status_code} - {resp.text}"
                 logger.error(error_msg)
                 yield ErrorFrame(error=error_msg)
-                yield TTSStoppedFrame()
                 return
 
             await self.stop_ttfb_metrics()
+            if generation_id != self._generation_id:
+                logger.info(
+                    f"MagpieHTTPTTS: generation_cancelled generation={generation_id} "
+                    f"current_generation={self._generation_id}"
+                )
+                return
 
             audio_bytes = resp.content
 
@@ -164,8 +229,8 @@ class MagpieHTTPTTSService(TTSService):
             duration_ms = float(resp.headers.get("X-Duration-Ms", 0))
 
             logger.info(
-                f"MagpieHTTPTTS: Received {len(audio_bytes)} bytes, "
-                f"duration={duration_ms:.0f}ms at {sample_rate}Hz"
+                f"MagpieHTTPTTS: yield_audio generation={generation_id} "
+                f"bytes={len(audio_bytes)} sample_rate={sample_rate} duration_ms={duration_ms:.0f}"
             )
 
             yield TTSAudioRawFrame(
@@ -175,18 +240,23 @@ class MagpieHTTPTTSService(TTSService):
             )
 
             await self.start_tts_usage_metrics(text)
-            yield TTSStoppedFrame()
 
         except httpx.ConnectError as e:
             error_msg = f"Cannot connect to TTS server at {self._server_url}: {e}"
             logger.error(error_msg)
             yield ErrorFrame(error=error_msg)
-            yield TTSStoppedFrame()
 
         except Exception as e:
             logger.error(f"MagpieHTTPTTS error: {e}")
             yield ErrorFrame(error=str(e))
+        finally:
+            await self.stop_ttfb_metrics()
+            logger.info(f"MagpieHTTPTTS: yield_stopped generation={generation_id}")
             yield TTSStoppedFrame()
+            await self.push_frame(
+                ChunkedLLMContinueGenerationFrame(),
+                FrameDirection.UPSTREAM,
+            )
 
     async def close(self):
         """Close HTTP client."""

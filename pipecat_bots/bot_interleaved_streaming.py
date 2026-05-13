@@ -11,7 +11,8 @@
 #   NVIDIA_ASR_URL        Nemotron ASR WebSocket URL (default: ws://localhost:8080)
 #   VOXTRAL_ASR_URL       Voxtral Realtime URL (default: ws://localhost:8082/v1/realtime)
 #   NVIDIA_LLAMA_CPP_URL  llama.cpp API URL (default: http://localhost:8000)
-#   NVIDIA_TTS_URL        Orpheus TTS server URL (default: http://localhost:8001)
+#   NVIDIA_TTS_URL        TTS server URL (default: http://localhost:8001)
+#   TTS_BACKEND           orpheus_http (default), magpie_http, or magpie_ws
 #   ENABLE_RECORDING      Enable audio recording (default: false)
 #
 # Usage:
@@ -35,7 +36,7 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import Frame, LLMMessagesFrame, LLMRunFrame
+from pipecat.frames.frames import Frame, LLMMessagesFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -53,6 +54,8 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 # Import our custom local services
 from asr_audio_diagnostics import ASRAudioDiagnosticsProcessor
 from asr_factory import create_stt_service, describe_asr_backend
+from magpie_http_tts import MagpieHTTPTTSService
+from magpie_websocket_tts import MagpieWebSocketTTSService
 from orpheus_http_tts import OrpheusHTTPTTSService
 from llama_cpp_buffered_llm import LlamaCppBufferedLLMService
 from v2v_metrics import V2VMetricsProcessor
@@ -75,6 +78,10 @@ load_dotenv(override=True)
 # Configuration from environment
 NVIDIA_LLAMA_CPP_URL = os.getenv("NVIDIA_LLAMA_CPP_URL", "http://localhost:8000")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
+TTS_BACKEND = os.getenv("TTS_BACKEND", "orpheus_http").lower()
+MAGPIE_VOICE = os.getenv("MAGPIE_VOICE", "aria")
+ORPHEUS_VOICE = os.getenv("ORPHEUS_VOICE", "tara")
+USE_SMART_TURN = os.getenv("USE_SMART_TURN", "false").lower() in {"1", "true", "yes"}
 
 # Audio recording configuration
 ENABLE_RECORDING = os.getenv("ENABLE_RECORDING", "false").lower() == "true"
@@ -82,11 +89,12 @@ ENABLE_ASR_DIAGNOSTICS = os.getenv("ENABLE_ASR_DIAGNOSTICS", "false").lower() ==
 RECORDINGS_DIR = Path(__file__).parent.parent / "recordings"
 ASR_DIAGNOSTICS_DIR = os.getenv("ASR_DIAGNOSTICS_DIR", "diagnostics/asr")
 
-# VAD configuration - used by both VAD analyzer and V2V metrics
-VAD_CONFIDENCE = float(os.getenv("VAD_CONFIDENCE", "0.7"))
+# VAD configuration - used by both VAD analyzer and V2V metrics.
+# Thor/Nemotron ASR needs trailing context to avoid final-word truncation.
+VAD_CONFIDENCE = float(os.getenv("VAD_CONFIDENCE", "0.65"))
 VAD_START_SECS = float(os.getenv("VAD_START_SECS", "0.12"))
-VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "0.2"))
-VAD_MIN_VOLUME = float(os.getenv("VAD_MIN_VOLUME", "0.25"))
+VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "0.34"))
+VAD_MIN_VOLUME = float(os.getenv("VAD_MIN_VOLUME", "0.5"))
 
 
 def vad_params() -> VADParams:
@@ -96,6 +104,10 @@ def vad_params() -> VADParams:
         stop_secs=VAD_STOP_SECS,
         min_volume=VAD_MIN_VOLUME,
     )
+
+
+def smart_turn_analyzer():
+    return LocalSmartTurnAnalyzerV3(params=SmartTurnParams()) if USE_SMART_TURN else None
 
 
 def ensure_recordings_dir() -> Path:
@@ -131,21 +143,21 @@ transport_params = {
         audio_out_enabled=True,
         vad_audio_passthrough=True,
         vad_analyzer=SileroVADAnalyzer(params=vad_params()),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
+        turn_analyzer=smart_turn_analyzer(),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
         vad_audio_passthrough=True,
         vad_analyzer=SileroVADAnalyzer(params=vad_params()),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
+        turn_analyzer=smart_turn_analyzer(),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
         vad_audio_passthrough=True,
         vad_analyzer=SileroVADAnalyzer(params=vad_params()),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
+        turn_analyzer=smart_turn_analyzer(),
     ),
 }
 
@@ -155,27 +167,48 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"  ASR: {describe_asr_backend()}")
     logger.info(f"  LLM URL: {NVIDIA_LLAMA_CPP_URL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
+    logger.info(f"  TTS backend: {TTS_BACKEND}")
     logger.info(f"  Transport: {type(transport).__name__}")
     logger.info(f"  Recording: {'enabled' if ENABLE_RECORDING else 'disabled'}")
     logger.info(f"  ASR diagnostics: {'enabled' if ENABLE_ASR_DIAGNOSTICS else 'disabled'}")
     logger.info(
         "  VAD: "
         f"confidence={VAD_CONFIDENCE}, start_secs={VAD_START_SECS}, "
-        f"stop_secs={VAD_STOP_SECS}, min_volume={VAD_MIN_VOLUME}"
+        f"stop_secs={VAD_STOP_SECS}, min_volume={VAD_MIN_VOLUME}, smart_turn={USE_SMART_TURN}"
     )
 
     stt = create_stt_service(sample_rate=16000)
 
-    # Orpheus TTS via local HTTP streaming server.
-    # The adapter preserves the LLM/TTS continue-frame backpressure contract.
-    tts = OrpheusHTTPTTSService(
-        server_url=NVIDIA_TTS_URL,
-        voice=os.getenv("ORPHEUS_VOICE", "tara"),
-        params=OrpheusHTTPTTSService.InputParams(
+    if TTS_BACKEND in {"orpheus", "orpheus_http"}:
+        # Orpheus TTS via local HTTP streaming server.
+        # The adapter preserves the LLM/TTS continue-frame backpressure contract.
+        tts = OrpheusHTTPTTSService(
+            server_url=NVIDIA_TTS_URL,
+            voice=ORPHEUS_VOICE,
+            params=OrpheusHTTPTTSService.InputParams(language="en"),
+        )
+        logger.info("Using Orpheus HTTP TTS")
+    elif TTS_BACKEND in {"magpie_http", "magpie", "http", "batch"}:
+        tts = MagpieHTTPTTSService(
+            server_url=NVIDIA_TTS_URL,
+            voice=MAGPIE_VOICE,
+            params=MagpieHTTPTTSService.InputParams(language="en"),
+        )
+        logger.info("Using Magpie HTTP batch TTS")
+    elif TTS_BACKEND in {"magpie_ws", "websocket", "streaming"}:
+        tts = MagpieWebSocketTTSService(
+            server_url=NVIDIA_TTS_URL,
+            voice=MAGPIE_VOICE,
             language="en",
-        ),
-    )
-    logger.info("Using Orpheus HTTP TTS")
+            params=MagpieWebSocketTTSService.InputParams(
+                language="en",
+                streaming_preset="conservative",
+                use_adaptive_mode=True,
+            ),
+        )
+        logger.info("Using Magpie WebSocket TTS")
+    else:
+        raise ValueError(f"Unknown TTS_BACKEND: {TTS_BACKEND}")
 
     # Voice-to-voice response time metrics
     v2v_metrics = V2VMetricsProcessor(vad_stop_secs=VAD_STOP_SECS)
@@ -203,7 +236,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         {
             "role": "system",
             "content": (
-                "You are a helpful AI assistant running on an NVIDIA DGX Spark. "
+                "You are a helpful AI assistant running on an NVIDIA Jetson Thor developer kit. "
                 "You are built with Nemotron Three Nano, a large language model developed by NVIDIA. "
                 "Your goal is to have a natural conversation with the user. "
                 "Keep your responses concise and conversational since they will be spoken aloud. "
@@ -211,10 +244,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 "Always punctuate your responses using standard sentence punctuation: commas, periods, question marks, exclamation points, etc. "
                 "Always spell out numbers as words. "
             ),
-        },
-        {
-            "role": "user",
-            "content": "Say hello and ask how you can help.",
         },
     ]
 
@@ -284,7 +313,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             await audiobuffer.start_recording()
             logger.info("Recording started")
         await rtvi.set_bot_ready()
-        await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
