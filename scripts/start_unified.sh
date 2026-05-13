@@ -22,7 +22,10 @@
 #   VLLM_ATTENTION_BACKEND        - Attention backend (default: TRITON_ATTN)
 #
 # General:
-#   SERVICE_TIMEOUT               - Seconds to wait for each service to start (default: 60)
+#   TTS_ENGINE                    - "orpheus" (default) or "magpie"
+#   ORPHEUS_MODEL                 - Orpheus HF model (default: canopylabs/orpheus-3b-0.1-ft)
+#   ORPHEUS_GPU_MEMORY_UTILIZATION - vLLM GPU fraction for Orpheus TTS (default: 0.25)
+#   SERVICE_TIMEOUT               - Seconds to wait for each service to start
 #   HUGGINGFACE_ACCESS_TOKEN      - HuggingFace token for gated models
 #
 # Logs are written to /var/log/nemotron/{asr,tts,llm}.log for external access.
@@ -53,11 +56,11 @@ ENABLE_LLM="${ENABLE_LLM:-true}"
 ENABLE_ASR="${ENABLE_ASR:-true}"
 ENABLE_TTS="${ENABLE_TTS:-true}"
 LLM_MODE="${LLM_MODE:-llamacpp-q8}"
-# vLLM needs ~15 minutes to load the model, llama.cpp only needs ~60s
-if [[ "$LLM_MODE" == "vllm" ]]; then
+# vLLM modes need longer model load time. llama.cpp Q4/Q8 can also take ~90s.
+if [[ "$LLM_MODE" == vllm* ]]; then
     SERVICE_TIMEOUT="${SERVICE_TIMEOUT:-900}"
 else
-    SERVICE_TIMEOUT="${SERVICE_TIMEOUT:-60}"
+    SERVICE_TIMEOUT="${SERVICE_TIMEOUT:-300}"
 fi
 LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
 LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-16384}"
@@ -65,6 +68,9 @@ LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-0}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-16384}"
 VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-TRITON_ATTN}"
+TTS_ENGINE="${TTS_ENGINE:-orpheus}"
+ORPHEUS_MODEL="${ORPHEUS_MODEL:-canopylabs/orpheus-3b-0.1-ft}"
+ORPHEUS_GPU_MEMORY_UTILIZATION="${ORPHEUS_GPU_MEMORY_UTILIZATION:-0.25}"
 
 # Log directory
 LOG_DIR="/var/log/nemotron"
@@ -84,6 +90,10 @@ echo "    TTS: $([ "$ENABLE_TTS" = "true" ] && echo "ENABLED (port 8001)" || ech
 echo "    LLM: $([ "$ENABLE_LLM" = "true" ] && echo "ENABLED (port 8000, mode: $LLM_MODE)" || echo "DISABLED")"
 echo ""
 echo "  Logs: $LOG_DIR/{asr,tts,llm}.log"
+echo "  TTS Engine: $TTS_ENGINE"
+if [ "$TTS_ENGINE" = "orpheus" ]; then
+    echo "  Orpheus Model: $ORPHEUS_MODEL"
+fi
 echo "============================================"
 
 # Check if at least one service is enabled
@@ -256,11 +266,28 @@ TOTAL_STEPS=0
 [ "$ENABLE_TTS" = "true" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
 [ "$ENABLE_LLM" = "true" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
 
-# Start TTS first (smaller model, avoids GPU memory fragmentation on 32GB GPUs)
+# Start TTS first so it claims its GPU memory before ASR and LLM.
 if [ "$ENABLE_TTS" = "true" ]; then
     STEP=$((STEP + 1))
-    echo "[$STEP/$TOTAL_STEPS] Starting TTS server on port 8001..."
-    python -m nemotron_speech.tts_server --port 8001 > "$LOG_DIR/tts.log" 2>&1 &
+    case "$TTS_ENGINE" in
+        orpheus)
+            echo "[$STEP/$TOTAL_STEPS] Starting Orpheus TTS server on port 8001..."
+            python -m nemotron_speech.orpheus_tts_server \
+                --port 8001 \
+                --model "$ORPHEUS_MODEL" \
+                --gpu-memory-utilization "$ORPHEUS_GPU_MEMORY_UTILIZATION" \
+                > "$LOG_DIR/tts.log" 2>&1 &
+            ;;
+        magpie)
+            echo "[$STEP/$TOTAL_STEPS] Starting Magpie TTS server on port 8001..."
+            python -m nemotron_speech.tts_server --port 8001 > "$LOG_DIR/tts.log" 2>&1 &
+            ;;
+        *)
+            echo "ERROR: Unknown TTS_ENGINE: $TTS_ENGINE"
+            echo "Valid values: orpheus, magpie"
+            exit 1
+            ;;
+    esac
     TTS_PID=$!
     echo "  TTS started (PID $TTS_PID, log: $LOG_DIR/tts.log)"
 fi
@@ -423,7 +450,7 @@ echo "============================================"
 echo "All services started successfully!"
 echo "============================================"
 [ -n "$ASR_PID" ] && echo "  ASR: http://localhost:8080 (WebSocket) - PID $ASR_PID"
-[ -n "$TTS_PID" ] && echo "  TTS: http://localhost:8001 (WebSocket) - PID $TTS_PID"
+[ -n "$TTS_PID" ] && echo "  TTS: http://localhost:8001 (HTTP streaming) - PID $TTS_PID"
 [ -n "$LLM_PID" ] && echo "  LLM: http://localhost:8000 (HTTP API) - PID $LLM_PID"
 echo ""
 echo "  Logs: $LOG_DIR/{asr,tts,llm}.log"

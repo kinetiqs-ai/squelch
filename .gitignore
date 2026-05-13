@@ -50,6 +50,11 @@ env/
 # Claude Code
 .claude/
 
+# Local secrets and machine-specific runtime configuration
+.env
+.env.*
+!.env.example
+
 # Lock files (large and platform-specific)
 uv.lock
 
@@ -64,6 +69,8 @@ WEBSOCKET_PLANNING.md
 # Test outputs
 tests/fixtures/output/
 runs/
+test_outputs/
+diagnostics/
 
 # Large test fixtures (keep only harvard_16k.wav)
 tests/fixtures/harvard.wav

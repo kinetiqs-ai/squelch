@@ -8,9 +8,9 @@
 #   ./scripts/nemotron.sh start [OPTIONS]     Start the container
 #   ./scripts/nemotron.sh stop                Stop the container
 #   ./scripts/nemotron.sh restart [OPTIONS]   Restart the container
+#   ./scripts/nemotron.sh bot [BOT] [OPTIONS] Start a WebRTC bot for browser testing
 #   ./scripts/nemotron.sh status              Show container and service status
-#   ./scripts/nemotron.sh logs [SERVICE]      View logs (asr, tts, llm, or all)
-#   ./scripts/nemotron.sh bot [OPTIONS]       Start the WebRTC bot inside the container
+#   ./scripts/nemotron.sh logs [SERVICE]      View logs (asr, tts, llm, bot, or all)
 #   ./scripts/nemotron.sh shell               Open a shell in the container
 #   ./scripts/nemotron.sh help                Show this help message
 #
@@ -28,7 +28,6 @@
 #   ./scripts/nemotron.sh start --mode vllm --model nvidia/model-name
 #   ./scripts/nemotron.sh start --no-llm    # ASR + TTS only
 #   ./scripts/nemotron.sh logs llm          # View LLM logs
-#   ./scripts/nemotron.sh bot --host 0.0.0.0
 #   ./scripts/nemotron.sh logs              # View all logs interleaved
 
 set -e
@@ -37,7 +36,7 @@ set -e
 # Configuration
 # =============================================================================
 CONTAINER_NAME="${NEMOTRON_CONTAINER_NAME:-nemotron}"
-IMAGE_NAME="${NEMOTRON_IMAGE:-nemotron-unified:cuda13}"
+IMAGE_NAME="${NEMOTRON_IMAGE:-nemotron-unified:ampere}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -57,7 +56,12 @@ DEFAULT_VLLM_FP8_MODEL="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
 
 # HuggingFace model cache paths for ASR and TTS (auto-downloaded on first run)
 HF_CACHE_ASR="$HOME/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b"
-HF_CACHE_TTS="$HOME/.cache/huggingface/hub/models--nvidia--magpie_tts_multilingual_357m"
+TTS_ENGINE="${TTS_ENGINE:-orpheus}"
+if [[ "$TTS_ENGINE" == "magpie" ]]; then
+    HF_CACHE_TTS="$HOME/.cache/huggingface/hub/models--nvidia--magpie_tts_multilingual_357m"
+else
+    HF_CACHE_TTS="$HOME/.cache/huggingface/hub/models--canopylabs--orpheus-3b-0.1-ft"
+fi
 
 # Auto-detect LLM mode based on available models (prefer Q8 if available)
 if [[ -n "$DEFAULT_Q8_MODEL" ]]; then
@@ -82,9 +86,9 @@ Commands:
   start [OPTIONS]     Start the container
   stop                Stop the container
   restart [OPTIONS]   Restart the container
+  bot [BOT] [OPTIONS] Start a WebRTC bot for browser testing
   status              Show container and service status
-  logs [SERVICE]      View logs (asr, tts, llm, or all)
-  bot [OPTIONS]       Start WebRTC bot inside the running container
+  logs [SERVICE]      View logs (asr, tts, llm, bot, or all)
   shell               Open a shell in the container
   help                Show this help message
 
@@ -96,6 +100,13 @@ Start Options:
   --no-llm            Disable LLM service
   --detach, -d        Run in background (default)
   --foreground, -f    Run in foreground
+
+Bot Options:
+  BOT                 interleaved (default), tools, or simple
+  --port PORT         WebRTC runner port (default: 7860; tools defaults to 7861)
+  --host HOST         WebRTC bind host (default: 0.0.0.0)
+  --asr BACKEND       ASR backend for bot: nemotron (default) or voxtral
+  --foreground, -f    Attach to bot logs instead of starting in background
 
 Examples:
   # Start with default Q8 model
@@ -111,16 +122,22 @@ Examples:
   # View LLM logs
   ./scripts/nemotron.sh logs llm
 
-  # Start browser bot on the Tailscale-accessible port
-  ./scripts/nemotron.sh bot --host 0.0.0.0 --port 7860
-
   # Follow all logs
   ./scripts/nemotron.sh logs
 
+  # Start browser-test bot, then open http://localhost:7860/client
+  ./scripts/nemotron.sh bot
+
+  # Start tool-calling bot, then open http://localhost:7861/client
+  ./scripts/nemotron.sh bot tools
+
 Environment Variables:
   NEMOTRON_CONTAINER_NAME   Container name (default: nemotron)
-  NEMOTRON_IMAGE            Docker image (default: nemotron-unified:cuda13)
+  NEMOTRON_IMAGE            Docker image (default: nemotron-unified:ampere)
   HUGGINGFACE_ACCESS_TOKEN  HuggingFace token for gated models
+  TTS_ENGINE                TTS service to start: orpheus (default) or magpie
+  ORPHEUS_MODEL             Orpheus TTS model (default: canopylabs/orpheus-3b-0.1-ft)
+  ORPHEUS_VOICE             Orpheus voice used by bots (default: tara)
 EOF
 }
 
@@ -332,6 +349,7 @@ cmd_start() {
             --gpus all
             --network=host
             --ipc=host
+            --add-host=host.docker.internal:host-gateway
             -v "$PROJECT_DIR:/workspace"
             -v "$HOME/.cache/huggingface:/root/.cache/huggingface"
             -e "ENABLE_ASR=$ENABLE_ASR"
@@ -341,6 +359,9 @@ cmd_start() {
             -e "HF_HOME=/root/.cache/huggingface"
             -e "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
             -e "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}"
+            -e "TTS_ENGINE=$TTS_ENGINE"
+            -e "ORPHEUS_MODEL=${ORPHEUS_MODEL:-canopylabs/orpheus-3b-0.1-ft}"
+            -e "ORPHEUS_GPU_MEMORY_UTILIZATION=${ORPHEUS_GPU_MEMORY_UTILIZATION:-0.25}"
         )
     else
         DOCKER_ARGS=(
@@ -348,6 +369,7 @@ cmd_start() {
             --name "$CONTAINER_NAME"
             --gpus all
             --ipc=host
+            --add-host=host.docker.internal:host-gateway
             -v "$PROJECT_DIR:/workspace"
             -v "$HOME/.cache/huggingface:/root/.cache/huggingface"
             -p 8000:8000
@@ -362,11 +384,14 @@ cmd_start() {
             -e "HF_HOME=/root/.cache/huggingface"
             -e "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
             -e "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}"
+            -e "TTS_ENGINE=$TTS_ENGINE"
+            -e "ORPHEUS_MODEL=${ORPHEUS_MODEL:-canopylabs/orpheus-3b-0.1-ft}"
+            -e "ORPHEUS_GPU_MEMORY_UTILIZATION=${ORPHEUS_GPU_MEMORY_UTILIZATION:-0.25}"
         )
     fi
 
-    # Magpie batch TTS defaults for Thor. These are passed through explicitly so
-    # the container behavior is reproducible even when the image has older ENV.
+    # Magpie batch/streaming TTS defaults for the Thor quality baseline. These
+    # are harmless when TTS_ENGINE=orpheus and keep Magpie runs reproducible.
     DOCKER_ARGS+=(-e "MAGPIE_SAMPLE_RATE=${MAGPIE_SAMPLE_RATE:-22050}")
     DOCKER_ARGS+=(-e "MAGPIE_APPLY_TN=${MAGPIE_APPLY_TN:-true}")
     if [[ -n "${MAGPIE_USE_CFG:-}" ]]; then
@@ -508,12 +533,20 @@ cmd_bot() {
 
     if ! is_container_running; then
         echo "ERROR: Container '$CONTAINER_NAME' is not running"
+        echo "Start it first with './scripts/nemotron.sh start'"
         exit 1
     fi
 
-    BOT_PORT="${BOT_PORT:-7860}"
+    BOT_NAME="interleaved"
+    BOT_PORT=""
     BOT_HOST="${BOT_HOST:-0.0.0.0}"
+    BOT_ASR="${ASR_BACKEND:-nemotron}"
     BOT_FOREGROUND="false"
+
+    if [[ $# -gt 0 ]] && [[ "$1" != --* ]] && [[ "$1" != "-f" ]]; then
+        BOT_NAME="$1"
+        shift
+    fi
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -523,6 +556,10 @@ cmd_bot() {
                 ;;
             --host)
                 BOT_HOST="$2"
+                shift 2
+                ;;
+            --asr)
+                BOT_ASR="$2"
                 shift 2
                 ;;
             --foreground|-f)
@@ -537,30 +574,64 @@ cmd_bot() {
         esac
     done
 
-    LOG_FILE="/var/log/nemotron/bot-interleaved.log"
-    BOT_ENV="TTS_BACKEND=${TTS_BACKEND:-magpie_http}"
+    case "$BOT_NAME" in
+        interleaved)
+            BOT_SCRIPT="pipecat_bots/bot_interleaved_streaming.py"
+            BOT_PORT="${BOT_PORT:-7860}"
+            LOG_FILE="/var/log/nemotron/bot-interleaved.log"
+            ;;
+        tools)
+            BOT_SCRIPT="pipecat_bots/bot_tools_test.py"
+            BOT_PORT="${BOT_PORT:-7861}"
+            LOG_FILE="/var/log/nemotron/bot-tools.log"
+            ;;
+        simple)
+            BOT_SCRIPT="pipecat_bots/bot_simple_vad.py"
+            BOT_PORT="${BOT_PORT:-7860}"
+            LOG_FILE="/var/log/nemotron/bot-simple.log"
+            ;;
+        *)
+            echo "ERROR: Unknown bot: $BOT_NAME"
+            echo "Valid bots: interleaved, tools, simple"
+            exit 1
+            ;;
+    esac
+
+    BOT_ENV="ASR_BACKEND=$BOT_ASR"
+    BOT_ENV="$BOT_ENV TTS_BACKEND=${TTS_BACKEND:-orpheus_http}"
     BOT_ENV="$BOT_ENV MAGPIE_VOICE=${MAGPIE_VOICE:-aria}"
+    BOT_ENV="$BOT_ENV ORPHEUS_VOICE=${ORPHEUS_VOICE:-tara}"
     BOT_ENV="$BOT_ENV VAD_STOP_SECS=${VAD_STOP_SECS:-0.34}"
     BOT_ENV="$BOT_ENV VAD_START_SECS=${VAD_START_SECS:-0.12}"
     BOT_ENV="$BOT_ENV VAD_CONFIDENCE=${VAD_CONFIDENCE:-0.65}"
     BOT_ENV="$BOT_ENV VAD_MIN_VOLUME=${VAD_MIN_VOLUME:-0.5}"
     BOT_ENV="$BOT_ENV USE_SMART_TURN=${USE_SMART_TURN:-false}"
-    BOT_ENV="$BOT_ENV NVIDIA_ASR_URL=${NVIDIA_ASR_URL:-ws://localhost:8080}"
     BOT_ENV="$BOT_ENV NVIDIA_TTS_URL=${NVIDIA_TTS_URL:-http://localhost:8001}"
     BOT_ENV="$BOT_ENV NVIDIA_LLAMA_CPP_URL=${NVIDIA_LLAMA_CPP_URL:-http://localhost:8000}"
+    if [[ "${ENABLE_ASR_DIAGNOSTICS:-false}" == "true" ]]; then
+        BOT_ENV="$BOT_ENV ENABLE_ASR_DIAGNOSTICS=true"
+        BOT_ENV="$BOT_ENV ASR_DIAGNOSTICS_DIR=${ASR_DIAGNOSTICS_DIR:-diagnostics/asr}"
+    fi
+    if [[ "$BOT_ASR" == "voxtral" ]]; then
+        BOT_ENV="$BOT_ENV VOXTRAL_ASR_URL=${VOXTRAL_ASR_URL:-ws://172.17.0.1:8082/v1/realtime}"
+    fi
 
-    BOT_CMD="cd /workspace && $BOT_ENV python pipecat_bots/bot_interleaved_streaming.py -t webrtc --host $BOT_HOST --port $BOT_PORT"
+    BOT_CMD="cd /workspace && $BOT_ENV python $BOT_SCRIPT -t webrtc --host $BOT_HOST --port $BOT_PORT"
 
     if [[ "$BOT_FOREGROUND" == "true" ]]; then
-        echo "Starting WebRTC bot in foreground..."
+        echo "Starting $BOT_NAME bot in foreground..."
+        echo "ASR backend: $BOT_ASR"
+        echo "TTS backend: ${TTS_BACKEND:-orpheus_http}"
         echo "Bind: $BOT_HOST:$BOT_PORT"
         echo "Open http://localhost:${BOT_PORT}/client in your browser"
         docker exec -it "$CONTAINER_NAME" bash -lc "$BOT_CMD"
     else
-        echo "Starting WebRTC bot in background..."
-        docker exec "$CONTAINER_NAME" bash -lc "pkill -f '[p]ipecat_bots/bot_interleaved_streaming.py' 2>/dev/null || true"
+        echo "Starting $BOT_NAME bot in background..."
+        docker exec "$CONTAINER_NAME" bash -lc "pkill -f '[p]ipecat_bots/.*\\.py -t webrtc' 2>/dev/null || true"
         docker exec -d "$CONTAINER_NAME" bash -lc "mkdir -p /var/log/nemotron && $BOT_CMD > $LOG_FILE 2>&1"
         echo "Bot started."
+        echo "ASR backend: $BOT_ASR"
+        echo "TTS backend: ${TTS_BACKEND:-orpheus_http}"
         echo "Bind: $BOT_HOST:$BOT_PORT"
         echo "Open http://localhost:${BOT_PORT}/client in your browser"
         echo "Logs: ./scripts/nemotron.sh logs bot"
@@ -660,10 +731,6 @@ cmd_logs() {
             echo "=== LLM Logs (Ctrl+C to exit) ==="
             docker exec "$CONTAINER_NAME" tail -f /var/log/nemotron/llm.log
             ;;
-        bot)
-            echo "=== Bot Logs (Ctrl+C to exit) ==="
-            docker exec "$CONTAINER_NAME" tail -f /var/log/nemotron/bot-interleaved.log
-            ;;
         all)
             echo "=== All Logs (Ctrl+C to exit) ==="
             echo "  [ASR] = ASR service, [TTS] = TTS service, [LLM] = LLM service, [BOT] = WebRTC bot"
@@ -673,9 +740,13 @@ cmd_logs() {
                 tail -f /var/log/nemotron/asr.log 2>/dev/null | sed "s/^/[ASR] /" &
                 tail -f /var/log/nemotron/tts.log 2>/dev/null | sed "s/^/[TTS] /" &
                 tail -f /var/log/nemotron/llm.log 2>/dev/null | sed "s/^/[LLM] /" &
-                tail -f /var/log/nemotron/bot-interleaved.log 2>/dev/null | sed "s/^/[BOT] /" &
+                tail -f /var/log/nemotron/bot-*.log 2>/dev/null | sed "s/^/[BOT] /" &
                 wait
             '
+            ;;
+        bot)
+            echo "=== Bot Logs (Ctrl+C to exit) ==="
+            docker exec "$CONTAINER_NAME" bash -c 'tail -f /var/log/nemotron/bot-*.log'
             ;;
         *)
             echo "ERROR: Unknown service: $SERVICE"
@@ -716,14 +787,14 @@ case "$COMMAND" in
     restart)
         cmd_restart "$@"
         ;;
+    bot)
+        cmd_bot "$@"
+        ;;
     status)
         cmd_status
         ;;
     logs)
         cmd_logs "$@"
-        ;;
-    bot)
-        cmd_bot "$@"
         ;;
     shell)
         cmd_shell
