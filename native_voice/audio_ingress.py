@@ -14,7 +14,7 @@ from collections.abc import Iterable
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import riva.client
 with warnings.catch_warnings():
@@ -45,6 +45,7 @@ from audio_edge_agent.protocol import (
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from native_voice.diagnostics import SessionDiagnostics
+from native_voice.orchestrator import VoiceOrchestrator
 from native_voice.riva_pipeline import (
     RIVA_CHUNK_BYTES,
     RIVA_CHUNK_FRAMES,
@@ -206,6 +207,7 @@ class RivaWorker:
         outbound: asyncio.Queue[str | bytes | None],
         diagnostics: SessionDiagnostics,
         started_at: float,
+        final_callback: Callable[[str], None] | None = None,
         leading_silence_ms: int = 0,
     ) -> None:
         self.session_id = session_id
@@ -214,6 +216,7 @@ class RivaWorker:
         self.outbound = outbound
         self.diagnostics = diagnostics
         self.started_at = started_at
+        self.final_callback = final_callback
         self.leading_silence_ms = leading_silence_ms
         self.stop_event = threading.Event()
         self.assembler = TranscriptAssembler()
@@ -281,6 +284,7 @@ class RivaWorker:
             if first_payload is _SEGMENT_END:
                 continue
             try:
+                segment_start_final_count = len(self.assembler.final_segments)
                 responses = asr_service.streaming_response_generator(
                     audio_chunks=self._audio_chunks(first_payload),
                     streaming_config=build_streaming_config(),
@@ -297,6 +301,12 @@ class RivaWorker:
                             message["text"],
                             message["committed_text"],
                         )
+                if not self.stop_event.is_set() and self.final_callback is not None:
+                    segment_text = " ".join(
+                        self.assembler.final_segments[segment_start_final_count:]
+                    ).strip()
+                    if segment_text:
+                        self._emit_segment_final(segment_text)
             except Exception as exc:  # noqa: BLE001 - diagnostics should capture service failures.
                 self.diagnostics.asr.write(
                     {
@@ -327,6 +337,16 @@ class RivaWorker:
 
         self.event_loop.call_soon_threadsafe(enqueue)
 
+    def _emit_segment_final(self, text: str) -> None:
+        if self.final_callback is None:
+            return
+
+        def enqueue() -> None:
+            if self.final_callback is not None:
+                self.final_callback(text)
+
+        self.event_loop.call_soon_threadsafe(enqueue)
+
 
 @router.websocket("/ws/audio-ingress")
 async def websocket_audio_ingress(websocket: WebSocket) -> None:
@@ -351,7 +371,17 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
     diagnostics = SessionDiagnostics(session_id=session_id)
     started_at = time.monotonic()
     audio_queue: queue.Queue[bytes | object | None] = queue.Queue(maxsize=500)
-    outbound: asyncio.Queue[str | bytes | None] = asyncio.Queue(maxsize=500)
+    outbound: asyncio.Queue[str | bytes | None] = asyncio.Queue(maxsize=2500)
+    orchestrator = VoiceOrchestrator(session_id=session_id, outbound=outbound, diagnostics=diagnostics)
+    turn_tasks: set[asyncio.Task[None]] = set()
+
+    def on_final_transcript(text: str) -> None:
+        task = orchestrator.schedule_final_transcript(text)
+        if task is None:
+            return
+        turn_tasks.add(task)
+        task.add_done_callback(turn_tasks.discard)
+
     vad_gate = VadGate()
     worker = RivaWorker(
         session_id=session_id,
@@ -360,6 +390,7 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
         outbound=outbound,
         diagnostics=diagnostics,
         started_at=started_at,
+        final_callback=on_final_transcript,
         leading_silence_ms=0,
     )
     worker.start()
@@ -600,6 +631,10 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
                 await return_test_task
             except asyncio.CancelledError:
                 pass
+        for task in list(turn_tasks):
+            task.cancel()
+        if turn_tasks:
+            await asyncio.gather(*turn_tasks, return_exceptions=True)
         worker.finish(drain=closed_reason == "audio_stop")
         await asyncio.to_thread(worker.join, 10.0)
         try:

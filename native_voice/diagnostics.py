@@ -44,6 +44,7 @@ class SessionDiagnostics:
 
         self.transport = JsonlWriter(self.run_dir / "transport.jsonl")
         self.asr = JsonlWriter(self.run_dir / "asr_events.jsonl")
+        self.agent = JsonlWriter(self.run_dir / "agent_events.jsonl")
         self._summary_path = self.run_dir / "summary.json"
         self._closed = False
 
@@ -64,3 +65,4 @@ class SessionDiagnostics:
         self._wav_file.close()
         self.transport.close()
         self.asr.close()
+        self.agent.close()

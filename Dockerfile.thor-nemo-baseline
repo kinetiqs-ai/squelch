@@ -1,0 +1,64 @@
+# Thor v0.1.0 quality baseline image.
+#
+# Starts from the existing Jetson Thor CUDA/PyTorch/llama.cpp image and adds the
+# NeMo ASR/TTS runtime required by the v0.1.0 NVIDIA ASR plus Magpie stack.
+#
+# Build:
+#   sg docker -c 'docker build -f Dockerfile.thor-nemo-baseline -t squelch-v010-nemo:thor .'
+
+FROM nemotron-unified:thor
+
+ARG NEMO_REF=main
+
+RUN uv pip install --no-cache \
+    Cython \
+    "hydra-core>=1.3.0" \
+    "omegaconf>=2.3" \
+    "pytorch-lightning>=2.0" \
+    "torchmetrics>=0.11.0" \
+    sentencepiece \
+    webdataset \
+    "lhotse>=1.20.0" \
+    braceexpand \
+    editdistance \
+    g2p_en \
+    inflect \
+    kaldi-python-io \
+    kaldiio \
+    "librosa>=0.10.0" \
+    marshmallow \
+    ruamel.yaml \
+    soundfile \
+    text-unidecode \
+    numba \
+    kaldialign
+
+RUN rm -rf /opt/nemo && \
+    git clone https://github.com/NVIDIA/NeMo.git /opt/nemo && \
+    cd /opt/nemo && git checkout ${NEMO_REF} && \
+    uv pip install --no-cache -e ".[asr,tts]"
+
+# NeMo dependency resolution can move PyTorch. Re-pin the Jetson Thor CUDA stack.
+RUN uv pip install --no-cache --force-reinstall --no-deps \
+    --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130 \
+    torch==2.10.0 \
+    torchaudio==2.10.0 \
+    torchvision==0.25.0 \
+    triton==3.6.0
+
+WORKDIR /workspace
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+COPY pipecat_bots/ ./pipecat_bots/
+RUN uv pip install --no-cache -e .
+
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/root/.cache/huggingface
+ENV HF_HUB_DISABLE_XET=1
+ENV MAGPIE_SAMPLE_RATE=22050
+ENV MAGPIE_APPLY_TN=true
+ENV MAGPIE_USE_CFG=false
+
+EXPOSE 8000 8001 8080 7860 7861
+
+CMD ["bash", "/workspace/scripts/start_unified.sh"]

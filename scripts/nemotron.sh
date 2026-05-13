@@ -10,6 +10,7 @@
 #   ./scripts/nemotron.sh restart [OPTIONS]   Restart the container
 #   ./scripts/nemotron.sh status              Show container and service status
 #   ./scripts/nemotron.sh logs [SERVICE]      View logs (asr, tts, llm, or all)
+#   ./scripts/nemotron.sh bot [OPTIONS]       Start the WebRTC bot inside the container
 #   ./scripts/nemotron.sh shell               Open a shell in the container
 #   ./scripts/nemotron.sh help                Show this help message
 #
@@ -27,6 +28,7 @@
 #   ./scripts/nemotron.sh start --mode vllm --model nvidia/model-name
 #   ./scripts/nemotron.sh start --no-llm    # ASR + TTS only
 #   ./scripts/nemotron.sh logs llm          # View LLM logs
+#   ./scripts/nemotron.sh bot --host 0.0.0.0
 #   ./scripts/nemotron.sh logs              # View all logs interleaved
 
 set -e
@@ -82,6 +84,7 @@ Commands:
   restart [OPTIONS]   Restart the container
   status              Show container and service status
   logs [SERVICE]      View logs (asr, tts, llm, or all)
+  bot [OPTIONS]       Start WebRTC bot inside the running container
   shell               Open a shell in the container
   help                Show this help message
 
@@ -107,6 +110,9 @@ Examples:
 
   # View LLM logs
   ./scripts/nemotron.sh logs llm
+
+  # Start browser bot on the Tailscale-accessible port
+  ./scripts/nemotron.sh bot --host 0.0.0.0 --port 7860
 
   # Follow all logs
   ./scripts/nemotron.sh logs
@@ -347,6 +353,8 @@ cmd_start() {
             -p 8000:8000
             -p 8001:8001
             -p 8080:8080
+            -p 127.0.0.1:7860:7860
+            -p 127.0.0.1:7861:7861
             -e "ENABLE_ASR=$ENABLE_ASR"
             -e "ENABLE_TTS=$ENABLE_TTS"
             -e "ENABLE_LLM=$ENABLE_LLM"
@@ -355,6 +363,29 @@ cmd_start() {
             -e "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
             -e "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}"
         )
+    fi
+
+    # Magpie batch TTS defaults for Thor. These are passed through explicitly so
+    # the container behavior is reproducible even when the image has older ENV.
+    DOCKER_ARGS+=(-e "MAGPIE_SAMPLE_RATE=${MAGPIE_SAMPLE_RATE:-22050}")
+    DOCKER_ARGS+=(-e "MAGPIE_APPLY_TN=${MAGPIE_APPLY_TN:-true}")
+    if [[ -n "${MAGPIE_USE_CFG:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_USE_CFG=$MAGPIE_USE_CFG")
+    fi
+    if [[ -n "${MAGPIE_MODEL:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_MODEL=$MAGPIE_MODEL")
+    fi
+    if [[ -n "${MAGPIE_MODEL_REVISION:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_MODEL_REVISION=$MAGPIE_MODEL_REVISION")
+    fi
+    if [[ -n "${MAGPIE_MODEL_FILENAME:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_MODEL_FILENAME=$MAGPIE_MODEL_FILENAME")
+    fi
+    if [[ -n "${MAGPIE_WARMUP_STREAMING:-}" ]]; then
+        DOCKER_ARGS+=(-e "MAGPIE_WARMUP_STREAMING=$MAGPIE_WARMUP_STREAMING")
+    fi
+    if [[ -n "${TTS_WARMUP_TEXT:-}" ]]; then
+        DOCKER_ARGS+=(-e "TTS_WARMUP_TEXT=$TTS_WARMUP_TEXT")
     fi
 
     # Add HuggingFace token if set
@@ -470,6 +501,73 @@ cmd_restart() {
 }
 
 # =============================================================================
+# Command: bot
+# =============================================================================
+cmd_bot() {
+    check_docker
+
+    if ! is_container_running; then
+        echo "ERROR: Container '$CONTAINER_NAME' is not running"
+        exit 1
+    fi
+
+    BOT_PORT="${BOT_PORT:-7860}"
+    BOT_HOST="${BOT_HOST:-0.0.0.0}"
+    BOT_FOREGROUND="false"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --port)
+                BOT_PORT="$2"
+                shift 2
+                ;;
+            --host)
+                BOT_HOST="$2"
+                shift 2
+                ;;
+            --foreground|-f)
+                BOT_FOREGROUND="true"
+                shift
+                ;;
+            *)
+                echo "Unknown bot option: $1"
+                print_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    LOG_FILE="/var/log/nemotron/bot-interleaved.log"
+    BOT_ENV="TTS_BACKEND=${TTS_BACKEND:-magpie_http}"
+    BOT_ENV="$BOT_ENV MAGPIE_VOICE=${MAGPIE_VOICE:-aria}"
+    BOT_ENV="$BOT_ENV VAD_STOP_SECS=${VAD_STOP_SECS:-0.34}"
+    BOT_ENV="$BOT_ENV VAD_START_SECS=${VAD_START_SECS:-0.12}"
+    BOT_ENV="$BOT_ENV VAD_CONFIDENCE=${VAD_CONFIDENCE:-0.65}"
+    BOT_ENV="$BOT_ENV VAD_MIN_VOLUME=${VAD_MIN_VOLUME:-0.5}"
+    BOT_ENV="$BOT_ENV USE_SMART_TURN=${USE_SMART_TURN:-false}"
+    BOT_ENV="$BOT_ENV NVIDIA_ASR_URL=${NVIDIA_ASR_URL:-ws://localhost:8080}"
+    BOT_ENV="$BOT_ENV NVIDIA_TTS_URL=${NVIDIA_TTS_URL:-http://localhost:8001}"
+    BOT_ENV="$BOT_ENV NVIDIA_LLAMA_CPP_URL=${NVIDIA_LLAMA_CPP_URL:-http://localhost:8000}"
+
+    BOT_CMD="cd /workspace && $BOT_ENV python pipecat_bots/bot_interleaved_streaming.py -t webrtc --host $BOT_HOST --port $BOT_PORT"
+
+    if [[ "$BOT_FOREGROUND" == "true" ]]; then
+        echo "Starting WebRTC bot in foreground..."
+        echo "Bind: $BOT_HOST:$BOT_PORT"
+        echo "Open http://localhost:${BOT_PORT}/client in your browser"
+        docker exec -it "$CONTAINER_NAME" bash -lc "$BOT_CMD"
+    else
+        echo "Starting WebRTC bot in background..."
+        docker exec "$CONTAINER_NAME" bash -lc "pkill -f '[p]ipecat_bots/bot_interleaved_streaming.py' 2>/dev/null || true"
+        docker exec -d "$CONTAINER_NAME" bash -lc "mkdir -p /var/log/nemotron && $BOT_CMD > $LOG_FILE 2>&1"
+        echo "Bot started."
+        echo "Bind: $BOT_HOST:$BOT_PORT"
+        echo "Open http://localhost:${BOT_PORT}/client in your browser"
+        echo "Logs: ./scripts/nemotron.sh logs bot"
+    fi
+}
+
+# =============================================================================
 # Command: status
 # =============================================================================
 cmd_status() {
@@ -518,6 +616,15 @@ cmd_status() {
         else
             echo "    LLM (port 8000): DOWN or DISABLED"
         fi
+
+        # Browser bot health
+        if curl -sf http://localhost:7860/client/ > /dev/null 2>&1; then
+            echo "    WebRTC bot (port 7860): UP"
+        elif curl -sf http://localhost:7861/client/ > /dev/null 2>&1; then
+            echo "    WebRTC bot (port 7861): UP"
+        else
+            echo "    WebRTC bot (ports 7860/7861): DOWN or NOT STARTED"
+        fi
     else
         echo "  Container: STOPPED"
         echo ""
@@ -553,21 +660,26 @@ cmd_logs() {
             echo "=== LLM Logs (Ctrl+C to exit) ==="
             docker exec "$CONTAINER_NAME" tail -f /var/log/nemotron/llm.log
             ;;
+        bot)
+            echo "=== Bot Logs (Ctrl+C to exit) ==="
+            docker exec "$CONTAINER_NAME" tail -f /var/log/nemotron/bot-interleaved.log
+            ;;
         all)
             echo "=== All Logs (Ctrl+C to exit) ==="
-            echo "  [ASR] = ASR service, [TTS] = TTS service, [LLM] = LLM service"
+            echo "  [ASR] = ASR service, [TTS] = TTS service, [LLM] = LLM service, [BOT] = WebRTC bot"
             echo ""
             # Use tail with headers, interleaved
             docker exec "$CONTAINER_NAME" bash -c '
                 tail -f /var/log/nemotron/asr.log 2>/dev/null | sed "s/^/[ASR] /" &
                 tail -f /var/log/nemotron/tts.log 2>/dev/null | sed "s/^/[TTS] /" &
                 tail -f /var/log/nemotron/llm.log 2>/dev/null | sed "s/^/[LLM] /" &
+                tail -f /var/log/nemotron/bot-interleaved.log 2>/dev/null | sed "s/^/[BOT] /" &
                 wait
             '
             ;;
         *)
             echo "ERROR: Unknown service: $SERVICE"
-            echo "Valid services: asr, tts, llm, all"
+            echo "Valid services: asr, tts, llm, bot, all"
             exit 1
             ;;
     esac
@@ -609,6 +721,9 @@ case "$COMMAND" in
         ;;
     logs)
         cmd_logs "$@"
+        ;;
+    bot)
+        cmd_bot "$@"
         ;;
     shell)
         cmd_shell

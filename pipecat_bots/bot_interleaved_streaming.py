@@ -2,7 +2,7 @@
 #
 # Pipecat bot with interleaved streaming for lowest latency.
 #
-# Uses buffered LLM (sentence-boundary streaming) with adaptive WebSocket TTS.
+# Uses buffered LLM (sentence-boundary streaming) with batch Magpie TTS by default.
 # Single-slot operation achieves 100% KV cache reuse across turns.
 # SmartTurn analyzer for responsive turn-taking.
 #
@@ -33,7 +33,7 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import Frame, LLMMessagesFrame, LLMRunFrame
+from pipecat.frames.frames import Frame, LLMMessagesFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -50,6 +50,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 # Import our custom local services
 from nvidia_stt import NVidiaWebSocketSTTService
+from magpie_http_tts import MagpieHTTPTTSService
 from magpie_websocket_tts import MagpieWebSocketTTSService
 from llama_cpp_buffered_llm import LlamaCppBufferedLLMService
 from v2v_metrics import V2VMetricsProcessor
@@ -73,13 +74,34 @@ load_dotenv(override=True)
 NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
 NVIDIA_LLAMA_CPP_URL = os.getenv("NVIDIA_LLAMA_CPP_URL", "http://localhost:8000")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
+TTS_BACKEND = os.getenv("TTS_BACKEND", "magpie_http").lower()
+MAGPIE_VOICE = os.getenv("MAGPIE_VOICE", "aria")
+USE_SMART_TURN = os.getenv("USE_SMART_TURN", "false").lower() in {"1", "true", "yes"}
 
 # Audio recording configuration
 ENABLE_RECORDING = os.getenv("ENABLE_RECORDING", "false").lower() == "true"
 RECORDINGS_DIR = Path(__file__).parent.parent / "recordings"
 
-# VAD configuration - used by both VAD analyzer and V2V metrics
-VAD_STOP_SECS = 0.2
+# VAD configuration - used by both VAD analyzer and V2V metrics.
+# v0.1.0's ASR debugging notes found that Nemotron/Parakeet needs trailing
+# context to avoid final-word truncation; 0.34s was the documented floor.
+VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "0.34"))
+VAD_START_SECS = float(os.getenv("VAD_START_SECS", "0.12"))
+VAD_CONFIDENCE = float(os.getenv("VAD_CONFIDENCE", "0.65"))
+VAD_MIN_VOLUME = float(os.getenv("VAD_MIN_VOLUME", "0.5"))
+
+
+def vad_params() -> VADParams:
+    return VADParams(
+        confidence=VAD_CONFIDENCE,
+        start_secs=VAD_START_SECS,
+        stop_secs=VAD_STOP_SECS,
+        min_volume=VAD_MIN_VOLUME,
+    )
+
+
+def smart_turn_analyzer():
+    return LocalSmartTurnAnalyzerV3(params=SmartTurnParams()) if USE_SMART_TURN else None
 
 
 def ensure_recordings_dir() -> Path:
@@ -113,20 +135,20 @@ transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
+        turn_analyzer=smart_turn_analyzer(),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
+        turn_analyzer=smart_turn_analyzer(),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params()),
+        turn_analyzer=smart_turn_analyzer(),
     ),
 }
 
@@ -136,9 +158,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
     logger.info(f"  LLM URL: {NVIDIA_LLAMA_CPP_URL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
+    logger.info(f"  TTS backend: {TTS_BACKEND}")
     logger.info(f"  Transport: {type(transport).__name__}")
     logger.info(f"  Recording: {'enabled' if ENABLE_RECORDING else 'disabled'}")
-    logger.info(f"  VAD stop_secs: {VAD_STOP_SECS}s")
+    logger.info(
+        f"  VAD: confidence={VAD_CONFIDENCE}, start_secs={VAD_START_SECS}, "
+        f"stop_secs={VAD_STOP_SECS}, min_volume={VAD_MIN_VOLUME}, smart_turn={USE_SMART_TURN}"
+    )
 
     # NVIDIA Parakeet ASR via WebSocket
     stt = NVidiaWebSocketSTTService(
@@ -146,19 +172,29 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         sample_rate=16000,
     )
 
-    # WebSocket Magpie TTS with adaptive mode
-    # Adaptive mode: streaming for first segment (~370ms TTFB), batch for subsequent (quality)
-    tts = MagpieWebSocketTTSService(
-        server_url=NVIDIA_TTS_URL,
-        voice="aria",
-        language="en",
-        params=MagpieWebSocketTTSService.InputParams(
+    if TTS_BACKEND in {"magpie_http", "http", "batch"}:
+        tts = MagpieHTTPTTSService(
+            server_url=NVIDIA_TTS_URL,
+            voice=MAGPIE_VOICE,
+            params=MagpieHTTPTTSService.InputParams(language="en"),
+        )
+        logger.info("Using HTTP batch Magpie TTS")
+    elif TTS_BACKEND in {"magpie_ws", "websocket", "streaming"}:
+        # Kept as an explicit opt-in for comparison. The Thor quality baseline
+        # should stay on HTTP batch until streaming artifacts are re-evaluated.
+        tts = MagpieWebSocketTTSService(
+            server_url=NVIDIA_TTS_URL,
+            voice=MAGPIE_VOICE,
             language="en",
-            streaming_preset="conservative",
-            use_adaptive_mode=True,
-        ),
-    )
-    logger.info("Using WebSocket Magpie TTS (adaptive mode)")
+            params=MagpieWebSocketTTSService.InputParams(
+                language="en",
+                streaming_preset="conservative",
+                use_adaptive_mode=True,
+            ),
+        )
+        logger.info("Using WebSocket Magpie TTS (adaptive mode)")
+    else:
+        raise ValueError(f"Unknown TTS_BACKEND: {TTS_BACKEND}")
 
     # Voice-to-voice response time metrics
     v2v_metrics = V2VMetricsProcessor(vad_stop_secs=VAD_STOP_SECS)
@@ -186,7 +222,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         {
             "role": "system",
             "content": (
-                "You are a helpful AI assistant running on an NVIDIA DGX Spark. "
+                "You are a helpful AI assistant running on an NVIDIA Jetson Thor developer kit. "
                 "You are built with Nemotron Three Nano, a large language model developed by NVIDIA. "
                 "Your goal is to have a natural conversation with the user. "
                 "Keep your responses concise and conversational since they will be spoken aloud. "
@@ -194,10 +230,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 "Always punctuate your responses using standard sentence punctuation: commas, periods, question marks, exclamation points, etc. "
                 "Always spell out numbers as words. "
             ),
-        },
-        {
-            "role": "user",
-            "content": "Say hello and ask how you can help.",
         },
     ]
 
@@ -260,7 +292,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             await audiobuffer.start_recording()
             logger.info("Recording started")
         await rtvi.set_bot_ready()
-        await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

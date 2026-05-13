@@ -37,8 +37,13 @@ from nemotron_speech.adaptive_stream import (
     get_stream_manager,
 )
 
-# Magpie TTS outputs at 22kHz
-MAGPIE_SAMPLE_RATE = 22000
+DEFAULT_MODEL = "nvidia/magpie_tts_multilingual_357m"
+DEFAULT_MODEL_REVISION = "291da791309b14fcee6f448c503671b11f37b281"
+DEFAULT_MODEL_FILENAME = "magpie_tts_multilingual_357m.nemo"
+
+# Magpie/nano codec output rate. Keep this configurable because NVIDIA NeMo
+# Magpie releases and local checkpoints have used both 22000 and 22050.
+MAGPIE_SAMPLE_RATE = int(os.getenv("MAGPIE_SAMPLE_RATE", "22050"))
 
 # Available speakers
 SPEAKERS = {
@@ -63,7 +68,92 @@ def get_model():
     return _model
 
 
-async def load_model(model_id: str = "nvidia/magpie_tts_multilingual_357m"):
+def env_truthy(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).lower() in {"1", "true", "yes"}
+
+
+_SMALL_NUMBER_WORDS = {
+    0: "zero",
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+    10: "ten",
+    11: "eleven",
+    12: "twelve",
+    13: "thirteen",
+    14: "fourteen",
+    15: "fifteen",
+    16: "sixteen",
+    17: "seventeen",
+    18: "eighteen",
+    19: "nineteen",
+}
+
+_TENS_NUMBER_WORDS = {
+    20: "twenty",
+    30: "thirty",
+    40: "forty",
+    50: "fifty",
+    60: "sixty",
+    70: "seventy",
+    80: "eighty",
+    90: "ninety",
+}
+
+_SPELLED_ACRONYMS = {
+    "AI",
+    "API",
+    "ASR",
+    "CPU",
+    "CUDA",
+    "GB",
+    "GPU",
+    "HTTP",
+    "HTTPS",
+    "LLM",
+    "PCM",
+    "RTF",
+    "TTS",
+    "URL",
+    "USB",
+    "VM",
+}
+
+
+def _number_to_words(value: int) -> str:
+    if value < 0:
+        return "minus " + _number_to_words(abs(value))
+    if value < 20:
+        return _SMALL_NUMBER_WORDS[value]
+    if value < 100:
+        tens = value // 10 * 10
+        ones = value % 10
+        return _TENS_NUMBER_WORDS[tens] if ones == 0 else f"{_TENS_NUMBER_WORDS[tens]} {_SMALL_NUMBER_WORDS[ones]}"
+    if value < 1000:
+        hundreds = value // 100
+        rest = value % 100
+        words = f"{_SMALL_NUMBER_WORDS[hundreds]} hundred"
+        return words if rest == 0 else f"{words} {_number_to_words(rest)}"
+    for scale, name in ((1_000_000_000, "billion"), (1_000_000, "million"), (1000, "thousand")):
+        if value >= scale:
+            high = value // scale
+            rest = value % scale
+            words = f"{_number_to_words(high)} {name}"
+            return words if rest == 0 else f"{words} {_number_to_words(rest)}"
+    return str(value)
+
+
+def _spell_letters(value: str) -> str:
+    return " ".join(value.upper())
+
+
+async def load_model(model_id: str = DEFAULT_MODEL):
     """Load Magpie TTS model."""
     global _model
 
@@ -71,7 +161,8 @@ async def load_model(model_id: str = "nvidia/magpie_tts_multilingual_357m"):
         if _model is not None:
             return _model
 
-        logger.info(f"Loading Magpie TTS model: {model_id}")
+        model_revision = os.getenv("MAGPIE_MODEL_REVISION", DEFAULT_MODEL_REVISION)
+        logger.info(f"Loading Magpie TTS model: {model_id} revision={model_revision}")
 
         def _load():
             from nemo.collections.tts.models import MagpieTTSModel
@@ -81,8 +172,23 @@ async def load_model(model_id: str = "nvidia/magpie_tts_multilingual_357m"):
             if hf_token:
                 os.environ["HF_TOKEN"] = hf_token
 
-            model = MagpieTTSModel.from_pretrained(model_id)
-            model = model.cuda()
+            if model_id.endswith(".nemo") or os.path.exists(model_id):
+                model = MagpieTTSModel.restore_from(model_id)
+            elif model_revision:
+                from huggingface_hub import hf_hub_download
+
+                model_path = hf_hub_download(
+                    repo_id=model_id,
+                    filename=os.getenv("MAGPIE_MODEL_FILENAME", DEFAULT_MODEL_FILENAME),
+                    revision=model_revision,
+                    token=hf_token,
+                )
+                model = MagpieTTSModel.restore_from(model_path)
+            else:
+                model = MagpieTTSModel.from_pretrained(model_id)
+
+            if torch.cuda.is_available():
+                model = model.cuda()
             model.eval()
             return model
 
@@ -97,14 +203,14 @@ async def load_model(model_id: str = "nvidia/magpie_tts_multilingual_357m"):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model and warm up on startup."""
-    model = await load_model()
+    model = await load_model(os.getenv("MAGPIE_MODEL", DEFAULT_MODEL))
 
-    # Warm up both batch and streaming paths to JIT compile CUDA kernels
-    logger.info("Warming up TTS model (batch + streaming paths)...")
+    # Warm up the batch path used by the Thor quality baseline. The old
+    # streaming path remains available but is no longer warmed by default.
+    logger.info("Warming up TTS model batch path...")
 
     def _warmup():
         import torch
-        from nemotron_speech.streaming_tts import StreamingMagpieTTS, StreamingConfig
 
         # Use a warmup text matching the longest expected input to pre-allocate GPU memory.
         # Too short = OOM during long inference; too long = LLM can't load.
@@ -116,29 +222,33 @@ async def lifespan(app: FastAPI):
         ))
 
         with torch.no_grad():
-            # Warm up batch path with long text to allocate peak memory
             logger.info(f"  Warming up batch inference ({len(warmup_text)} chars)...")
-            _, _ = model.do_tts(warmup_text, language="en", speaker_index=2, apply_TN=False)
-            torch.cuda.synchronize()
+            _do_tts(model, warmup_text, language="en", speaker_index=2)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-            # Warm up streaming path (with CFG enabled for quality)
-            logger.info("  Warming up streaming inference...")
-            config = StreamingConfig(
-                min_first_chunk_frames=8,
-                chunk_size_frames=16,
-                overlap_frames=12,
-                use_cfg=True,
-            )
-            streamer = StreamingMagpieTTS(model, config)
-            for _ in streamer.synthesize_streaming(warmup_text, language="en", speaker_index=2):
-                pass
-            torch.cuda.synchronize()
+            if env_truthy("MAGPIE_WARMUP_STREAMING", "false"):
+                from nemotron_speech.streaming_tts import StreamingConfig, StreamingMagpieTTS
+
+                logger.info("  Warming up streaming inference...")
+                config = StreamingConfig(
+                    min_first_chunk_frames=8,
+                    chunk_size_frames=16,
+                    overlap_frames=12,
+                    use_cfg=True,
+                )
+                streamer = StreamingMagpieTTS(model, config)
+                for _ in streamer.synthesize_streaming(warmup_text, language="en", speaker_index=2):
+                    pass
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
             # Release cached memory so LLM can load. The warmup pre-allocated peak
             # memory for TTS inference; now we free the cached intermediates while
             # keeping the model weights loaded.
-            torch.cuda.empty_cache()
-            logger.info("  Released CUDA cache after warmup")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("  Released CUDA cache after warmup")
 
     warmup_start = time.time()
     await asyncio.to_thread(_warmup)
@@ -181,6 +291,22 @@ class TTSConfig(BaseModel):
     encoding: str = "pcm_s16le"
     voices: list[str] = list(SPEAKERS.keys())
     languages: list[str] = LANGUAGES
+
+
+def _do_tts(model, text: str, *, language: str, speaker_index: int):
+    """Call Magpie TTS with quality flags when the installed NeMo supports them."""
+    kwargs = {
+        "language": language,
+        "speaker_index": speaker_index,
+        "apply_TN": env_truthy("MAGPIE_APPLY_TN", "true"),
+    }
+    if "MAGPIE_USE_CFG" in os.environ:
+        kwargs["use_cfg"] = env_truthy("MAGPIE_USE_CFG", "true")
+    try:
+        return model.do_tts(text, **kwargs)
+    except TypeError:
+        kwargs.pop("use_cfg", None)
+        return model.do_tts(text, **kwargs)
 
 
 @app.get("/health")
@@ -232,14 +358,7 @@ async def synthesize_speech(request: SpeechRequest):
             detail=f"Unknown language '{request.language}'. Available: {LANGUAGES}",
         )
 
-    # Normalize unicode characters
-    text = request.input
-    text = text.replace("\u2018", "'")  # LEFT SINGLE QUOTATION MARK
-    text = text.replace("\u2019", "'")  # RIGHT SINGLE QUOTATION MARK
-    text = text.replace("\u201C", '"')  # LEFT DOUBLE QUOTATION MARK
-    text = text.replace("\u201D", '"')  # RIGHT DOUBLE QUOTATION MARK
-    text = text.replace("\u2014", "-")  # EM DASH
-    text = text.replace("\u2013", "-")  # EN DASH
+    text = normalize_text(request.input)
 
     if not text.strip():
         raise HTTPException(status_code=400, detail="Empty input text")
@@ -248,12 +367,14 @@ async def synthesize_speech(request: SpeechRequest):
 
     def _synthesize():
         with torch.no_grad():
-            audio, audio_len = model.do_tts(
+            audio, audio_len = _do_tts(
+                model,
                 text,
                 language=language,
                 speaker_index=speaker_idx,
-                apply_TN=False,
             )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
         # Convert to numpy
         audio_np = audio.cpu().float().numpy()
@@ -280,6 +401,7 @@ async def synthesize_speech(request: SpeechRequest):
         f"TTS: {len(audio_bytes)} bytes, {duration_ms:.0f}ms audio, "
         f"latency={elapsed*1000:.0f}ms, RTF={elapsed/(duration_ms/1000):.2f}x"
     )
+    rtf = elapsed / (duration_ms / 1000) if duration_ms else 0.0
 
     # Return raw PCM bytes
     media_type = "audio/pcm" if request.response_format == "pcm" else "audio/wav"
@@ -291,6 +413,7 @@ async def synthesize_speech(request: SpeechRequest):
             "X-Channels": "1",
             "X-Encoding": "pcm_s16le",
             "X-Duration-Ms": str(int(duration_ms)),
+            "X-RTF": f"{rtf:.3f}",
         },
     )
 
@@ -316,12 +439,14 @@ _EMOJI_PATTERN = re.compile(
 
 
 def normalize_text(text: str) -> str:
-    """Normalize unicode characters in text.
+    """Normalize text for Magpie speech synthesis.
 
     Handles:
     - Smart quotes -> ASCII quotes
     - Em/en dashes -> hyphens
     - Emoji characters -> removed (causes tokenizer crash)
+    - Markdown/control punctuation -> speech-safe text
+    - Raw numerals and compact model IDs -> spoken words/letters
     """
     text = text.replace("\u2018", "'")  # LEFT SINGLE QUOTATION MARK
     text = text.replace("\u2019", "'")  # RIGHT SINGLE QUOTATION MARK
@@ -331,6 +456,36 @@ def normalize_text(text: str) -> str:
     text = text.replace("\u2013", "-")  # EN DASH
     # Remove emoji characters that crash the tokenizer
     text = _EMOJI_PATTERN.sub("", text)
+
+    # Strip common Markdown while preserving readable link text.
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"[*#>~]+", "", text)
+
+    # Make compact technical tokens pronounceable before number expansion.
+    text = re.sub(r"(?<=[A-Za-z])[_-](?=[A-Za-z0-9])", " ", text)
+    text = re.sub(r"(?<=[0-9])[_-](?=[A-Za-z])", " ", text)
+    text = re.sub(r"(?<=[A-Za-z])(?=[0-9])", " ", text)
+    text = re.sub(r"(?<=[0-9])(?=[A-Za-z])", " ", text)
+    text = re.sub(r"\.cpp\b", " dot C P P", text, flags=re.IGNORECASE)
+
+    def decimal_repl(match: re.Match[str]) -> str:
+        left, right = match.group(1), match.group(2)
+        return f"{_number_to_words(int(left))} point {' '.join(_SMALL_NUMBER_WORDS[int(ch)] for ch in right)}"
+
+    def number_repl(match: re.Match[str]) -> str:
+        return _number_to_words(int(match.group(0).replace(",", "")))
+
+    text = re.sub(r"\b(\d+)\.(\d+)\b", decimal_repl, text)
+    text = re.sub(r"\b\d{1,3}(?:,\d{3})+\b|\b\d+\b", number_repl, text)
+
+    def acronym_repl(match: re.Match[str]) -> str:
+        token = match.group(0)
+        return _spell_letters(token) if token.upper() in _SPELLED_ACRONYMS else token
+
+    text = re.sub(r"\b[A-Z]{2,}\b", acronym_repl, text)
+    text = re.sub(r"[_/\\|]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
@@ -928,20 +1083,24 @@ def _overlap_add(chunk1_tail: bytes, chunk2_head: bytes) -> bytes:
     t = np.arange(n, dtype=np.float32) / n
 
     # Adaptive blending based on correlation:
-    # - High correlation (>0.5): Hann overlap-add (COLA) - audio is similar
-    # - Low correlation: Equal-power crossfade - maintains constant energy during transition
+    # - High correlation (>0.5): Hann overlap-add (COLA) - audio is similar.
+    # - Low correlation: preserve most of the previous overlap and switch late
+    #   with a short fade. Full-width equal-power blending smeared unrelated
+    #   vocoder outputs and produced audible artifacts on Thor.
     if corr > 0.5:
         # Hann window halves - sum to 1.0 at every point (COLA constraint)
         w1 = 0.5 * (1.0 + np.cos(np.pi * t))  # 1.0 → 0.0
         w2 = 0.5 * (1.0 - np.cos(np.pi * t))  # 0.0 → 1.0
         blend_type = "hann"
     else:
-        # Equal-power crossfade for uncorrelated audio (w1² + w2² = 1)
-        # This maintains constant energy during the transition, reducing perceived "pop"
-        # For uncorrelated signals, linear crossfade causes a 3dB dip at the midpoint
-        w1 = np.cos(np.pi * t / 2)   # 1.0 → 0.0 (smooth)
-        w2 = np.sin(np.pi * t / 2)   # 0.0 → 1.0 (smooth)
-        blend_type = "equal-power"
+        transition_samples = min(int(MAGPIE_SAMPLE_RATE * 0.020), n)
+        w1 = np.ones(n, dtype=np.float32)
+        w2 = np.zeros(n, dtype=np.float32)
+        if transition_samples > 0:
+            fade_t = np.arange(transition_samples, dtype=np.float32) / transition_samples
+            w1[-transition_samples:] = 0.5 * (1.0 + np.cos(np.pi * fade_t))
+            w2[-transition_samples:] = 0.5 * (1.0 - np.cos(np.pi * fade_t))
+        blend_type = "late-fade"
 
     logger.debug(f"Overlap-add ({n} samples, {n/MAGPIE_SAMPLE_RATE*1000:.0f}ms): "
                  f"corr={corr:.3f}, diff_rms={diff_rms:.0f}, blend={blend_type}")
