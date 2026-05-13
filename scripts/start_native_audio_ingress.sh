@@ -7,6 +7,7 @@ exec uv run \
   --no-project \
   --with fastapi \
   --with "uvicorn[standard]" \
+  --with aiohttp \
   --with nvidia-riva-client \
   --with webrtcvad \
   --with "setuptools<81" \
