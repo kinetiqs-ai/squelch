@@ -9,11 +9,9 @@ import queue
 import threading
 import time
 import warnings
-import wave
 from collections.abc import Iterable
 from collections import deque
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
 import riva.client
@@ -29,8 +27,6 @@ from audio_edge_agent.protocol import (
     SAMPLE_FORMAT,
     SAMPLE_RATE,
     AsrTranscriptEvent,
-    AssistantAudioStart,
-    AssistantAudioStop,
     AudioStart,
     AudioStop,
     ErrorCode,
@@ -58,7 +54,6 @@ from native_voice.riva_pipeline import (
 
 router = APIRouter()
 logger = logging.getLogger("uvicorn.error")
-ROOT_DIR = Path(__file__).resolve().parents[1]
 
 EDGE_FRAMES_PER_RIVA_CHUNK = RIVA_CHUNK_BYTES // FRAME_SIZE_BYTES
 if RIVA_CHUNK_BYTES % FRAME_SIZE_BYTES:
@@ -406,10 +401,6 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
                 await websocket.send_text(payload)
 
     sender_task = asyncio.create_task(sender())
-    return_test = websocket.query_params.get("return_test")
-    return_test_task: asyncio.Task[None] | None = None
-    if return_test == "harvard":
-        return_test_task = asyncio.create_task(_send_harvard_return_test(outbound, session_id))
 
     frame_count = 0
     sequence_gaps = 0
@@ -625,12 +616,6 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
             raise
         closed_reason = "disconnect"
     finally:
-        if return_test_task is not None:
-            return_test_task.cancel()
-            try:
-                await return_test_task
-            except asyncio.CancelledError:
-                pass
         for task in list(turn_tasks):
             task.cancel()
         if turn_tasks:
@@ -675,36 +660,3 @@ async def websocket_audio_ingress(websocket: WebSocket) -> None:
             elapsed_ms,
             diagnostics.run_dir,
         )
-
-
-async def _send_harvard_return_test(
-    outbound: asyncio.Queue[str | bytes | None],
-    session_id: str,
-) -> None:
-    await asyncio.sleep(1.0)
-    wav_path = ROOT_DIR / "tests" / "fixtures" / "harvard_16k.wav"
-    stream_id = f"return-test-{int(time.time() * 1000)}"
-    await outbound.put(AssistantAudioStart(session_id=session_id, stream_id=stream_id).to_json_bytes().decode())
-
-    frame_count = 0
-    with wave.open(str(wav_path), "rb") as wav:
-        if wav.getframerate() != SAMPLE_RATE or wav.getnchannels() != CHANNELS or wav.getsampwidth() != 2:
-            raise RuntimeError(f"Unsupported return-test fixture format: {wav_path}")
-        while True:
-            payload = wav.readframes(FRAME_SIZE_BYTES // 2)
-            if not payload:
-                break
-            if len(payload) < FRAME_SIZE_BYTES:
-                payload += b"\x00" * (FRAME_SIZE_BYTES - len(payload))
-            header = FrameHeader(sequence=frame_count, timestamp_us=_now_us())
-            await outbound.put(header.encode(payload))
-            frame_count += 1
-            await asyncio.sleep(FRAME_DURATION_MS / 1000)
-
-    await outbound.put(
-        AssistantAudioStop(
-            session_id=session_id,
-            stream_id=stream_id,
-            frame_count=frame_count,
-        ).to_json_bytes().decode()
-    )

@@ -1,16 +1,10 @@
 # Model weights (download separately, ~120GB total)
 models/
 
-# Intermediate/deprecated Dockerfiles (keep only *-cuda13-build)
+# Deprecated Dockerfiles
 Dockerfile
 Dockerfile.asr
 Dockerfile.asr-cuda13
-
-# Development test files
-test_asr.py
-
-# External repositories (install via pip)
-pipecat/
 
 # Python
 __pycache__/
@@ -66,16 +60,9 @@ WEBSOCKET_PLANNING.md
 # Binary documentation
 *.pdf
 
-# Test outputs
-tests/fixtures/output/
+# Runtime outputs
 runs/
-test_outputs/
 diagnostics/
-
-# Large test fixtures (keep only harvard_16k.wav)
-tests/fixtures/harvard.wav
-tests/fixtures/test_speech.wav
-tests/fixtures/sample.flac
 
 # Temporary/generated files
 *.log

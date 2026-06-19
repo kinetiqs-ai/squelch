@@ -1,2 +1,1 @@
-"""Native voice test harnesses that bypass Pipecat."""
-
+"""Native voice ingress for the Squelch Thor-local voice stack."""

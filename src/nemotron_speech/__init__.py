@@ -1,4 +1,4 @@
-"""Nemotron-Speech-ASR: Streaming STT service for Pipecat on DGX Spark."""
+"""Magpie TTS support package for the Squelch Thor-local voice stack."""
 
 __version__ = "0.1.0"
 

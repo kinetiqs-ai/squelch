@@ -1,4 +1,4 @@
-"""Shared Riva ASR streaming helpers for native Thor audio ingress tests."""
+"""Shared Riva ASR streaming helpers for native Thor audio ingress."""
 
 from __future__ import annotations
 

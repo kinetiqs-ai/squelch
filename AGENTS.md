@@ -21,23 +21,20 @@ Verified local host facts:
 Important local caveats:
 
 - Do not assume x86_64, A100, CUDA 12.6, or `sm_80`.
-- Do not use `/home/ramp-genesis/squelch-v010-thor`; that worktree was removed
-  after merge cleanup.
+- Do not use removed historical worktrees; the canonical checkout is
+  `/home/ramp-genesis/squelch`.
 - Do not create extra Git worktrees unless the user explicitly asks.
-- The static hostname may not be useful for browser access; prefer the
-  configured Tailscale URL after verifying `tailscale serve status`.
+- Prefer the configured Tailscale URL after verifying `tailscale serve status`.
 - Docker may require `sudo`.
 - `~/.docker` may be root-owned from earlier sudo Docker use.
-- `jetson_clocks` requires root and should be enabled before benchmark runs.
 - Keep Hugging Face tokens and local model paths out of committed files.
 
 ## Project Shape
 
-Squelch is a Thor-local voice stack. The validated deployment path is the native
-audio-edge-agent flow:
+Squelch is a Thor-local voice stack. The only retained deployment path is:
 
 ```text
-audio-edge-agent -> native_voice ingress -> VAD -> Riva/NVIDIA ASR
+audio-edge-agent -> native_voice ingress -> VAD -> Riva ASR
   -> llama.cpp Nemotron LLM -> Magpie TTS -> audio-edge-agent playback
 ```
 
@@ -47,31 +44,25 @@ Primary files:
 | --- | --- |
 | Native ingress | `native_voice/audio_ingress.py`, `native_voice/riva_asr_app.py` |
 | Turn orchestration | `native_voice/orchestrator.py` |
-| Riva/NVIDIA ASR helpers | `native_voice/riva_pipeline.py` |
+| Riva ASR helpers | `native_voice/riva_pipeline.py` |
+| Diagnostics | `native_voice/diagnostics.py` |
 | Magpie TTS server | `src/nemotron_speech/tts_server.py` |
 | Magpie streaming presets | `src/nemotron_speech/streaming_tts.py` |
-| Native start scripts | `scripts/start_native_audio_ingress.sh`, `scripts/start_native_riva_asr.sh` |
-| Pipecat comparison path | `pipecat_bots/` |
-| Container management | `scripts/nemotron.sh`, `scripts/start_unified.sh` |
+| Magpie stream state | `src/nemotron_speech/adaptive_stream.py` |
+| Native start script | `scripts/start_native_audio_ingress.sh` |
+| Voice agent manager | `scripts/voice_agent.sh` |
 
 ## Current Decisions To Preserve
 
-- The native audio-edge-agent path is primary.
-- The Pipecat browser path is retained for comparison, not the default Thor
-  deployment path.
-- Chinese models are out of scope.
-- Orpheus is retained in the repo because custom voices matter, but it was not
-  the validated Thor-local runtime due real-time-factor constraints.
-- Magpie is the active Thor TTS target.
+- Riva ASR is the only ASR target.
+- llama.cpp Nemotron-3-Nano-30B-A3B Q4_K_M is the only LLM target.
+- Magpie is the only TTS target.
 - The first Magpie segment of each assistant response must use
   `startup_quality`.
 - Follow-on Magpie segments use `quality`.
-- `SQUELCH_STREAM_LLM_TO_TTS` must default to `0`; LLM-to-TTS token streaming
-  did not improve perceived latency and brought back the first-word artifact.
-- Persistent Magpie websockets are not the default; they did not solve the
-  artifact and caused second-turn reliability issues.
-- ASR must be gated by VAD before sending audio to Riva/NVIDIA ASR. Sending
-  silence/noise into ASR caused hallucinations.
+- `SQUELCH_STREAM_LLM_TO_TTS` must default to `0`.
+- ASR must be gated by VAD before sending audio to Riva. Sending silence/noise
+  into ASR caused hallucinations.
 - The VAD gate includes preroll and explicit segment-end finalization to avoid
   dropped first/final words.
 
@@ -92,7 +83,7 @@ External Tailscale endpoint:
 wss://ramp-genesis.tail314cde.ts.net:7860/ws/audio-ingress
 ```
 
-Before handing a test back to the user, verify:
+Before handing a live test back to the user, verify:
 
 ```bash
 curl -fsS http://127.0.0.1:7860/health
@@ -107,19 +98,19 @@ for pid in $(pgrep -f 'native_voice.riva_asr_app|uv run --no-project --with fast
   printf '%s ' "$pid"
   pwdx "$pid" 2>/dev/null || true
 done
-sudo docker inspect squelch-magpie-native --format '{{json .HostConfig.Binds}}' 2>/dev/null || true
+docker inspect squelch-magpie-native --format '{{json .HostConfig.Binds}}' 2>/dev/null || true
+docker inspect squelch-llm-native --format '{{json .HostConfig.Binds}}' 2>/dev/null || true
 ```
 
 ## Development Rules
 
-- Keep edits scoped to the active path unless the user asks for broader cleanup.
+- Keep edits scoped to the retained native path.
 - Prefer existing local service contracts over new abstractions.
 - Use structured parsing/protocol helpers instead of ad hoc byte/string handling.
 - Do not change model choices, VAD semantics, TTS presets, or service boundaries
   without calling out the reason.
-- Do not silently switch the project back to browser/Pipecat as the main path.
-- Do not revert user work. If the worktree is dirty, inspect and preserve before
-  cleanup.
+- Do not reintroduce deleted comparison, experimental, cloud, or legacy model
+  paths unless the user explicitly asks to recover them.
 - Do not commit `.env.local`, tokens, generated diagnostics, model files, or
   local caches.
 - If Docker commands fail due permissions, use `sudo` or explain the host setup
@@ -130,8 +121,9 @@ sudo docker inspect squelch-magpie-native --format '{{json .HostConfig.Binds}}' 
 Default focused checks:
 
 ```bash
-bash -n scripts/start_native_audio_ingress.sh scripts/start_native_riva_asr.sh scripts/nemotron.sh scripts/start_unified.sh scripts/voxtral.sh scripts/start_voxtral_asr.sh scripts/start_asr_tts.sh
-python -m compileall native_voice src/nemotron_speech pipecat_bots scripts/voice_agent_test_client.py scripts/compare_asr.py
+bash -n scripts/start_native_audio_ingress.sh
+bash -n scripts/voice_agent.sh
+python -m compileall native_voice src/nemotron_speech
 curl -fsS http://127.0.0.1:7860/health
 curl -fsS http://127.0.0.1:8101/health
 ```
